@@ -405,6 +405,22 @@ pub fn codex_user_agent(default: &str) -> String {
     default.to_string()
 }
 
+/// Maximum number of concurrent upstream Codex requests the proxy will start at
+/// once. ChatGPT rejects excess concurrent connections on a subscription with a
+/// 401 at the WebSocket handshake (surfaced as "Authentication failed"), so a
+/// burst of parallel agents through one shared proxy trips it. Capping the
+/// number of in-flight upstream starts queues the excess instead of letting it
+/// fail. `None` (env value "0") disables the cap. Default: 8.
+pub fn codex_max_concurrent() -> Option<usize> {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_CODEX_MAX_CONCURRENT")
+        && let Ok(value) = raw.trim().parse::<usize>()
+    {
+        return (value > 0).then_some(value);
+    }
+    Some(8)
+}
+
 pub fn codex_previous_response_id() -> bool {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_PREVIOUS_RESPONSE_ID") {
