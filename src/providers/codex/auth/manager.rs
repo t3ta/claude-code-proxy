@@ -1,7 +1,7 @@
 use std::sync::Arc;
-use std::sync::RwLock;
 #[cfg(test)]
 use std::sync::Mutex;
+use std::sync::RwLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -413,8 +413,7 @@ mod tests {
             .unwrap();
         // TTL 0 disables the in-memory cache so this test can assert that
         // out-of-band durable writes are observed on the very next read.
-        let manager =
-            CodexAuthManager::new_with_config(store, format!("{ISSUER}/oauth/token"), 0);
+        let manager = CodexAuthManager::new_with_config(store, format!("{ISSUER}/oauth/token"), 0);
         assert_eq!(manager.get_auth().await.unwrap().access, "first");
 
         manager
