@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 pub const KIMI_DEFAULT_MODEL: &str = "kimi-for-coding";
+pub const KIMI_ALLOWED_MODELS: &[&str] = &["kimi-for-coding", "k3"];
 
 static ALIAS_TARGETS: once_cell::sync::Lazy<HashMap<&'static str, &'static str>> =
     once_cell::sync::Lazy::new(|| {
@@ -17,6 +18,7 @@ static ALIAS_TARGETS: once_cell::sync::Lazy<HashMap<&'static str, &'static str>>
         m.insert("fable", KIMI_DEFAULT_MODEL);
         m.insert("claude-fable-5", KIMI_DEFAULT_MODEL);
         m.insert("kimi-for-coding", KIMI_DEFAULT_MODEL);
+        m.insert("k3", "k3");
         m
     });
 
@@ -29,7 +31,7 @@ pub fn resolve_model(model: &str) -> String {
 }
 
 pub fn assert_allowed_model(model: &str) -> Result<(), ModelNotAllowedError> {
-    if model != KIMI_DEFAULT_MODEL {
+    if !KIMI_ALLOWED_MODELS.contains(&model) {
         return Err(ModelNotAllowedError {
             model: model.to_string(),
         });
@@ -57,6 +59,12 @@ mod tests {
     #[test]
     fn resolve_haiku_to_default() {
         assert_eq!(resolve_model("haiku"), KIMI_DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn resolve_k3_passthrough() {
+        assert_eq!(resolve_model("k3"), "k3");
+        assert!(assert_allowed_model("k3").is_ok());
     }
 
     #[test]
