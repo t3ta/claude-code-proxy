@@ -272,6 +272,25 @@ fn build_messages(req: &MessagesRequest) -> Result<Vec<KimiMessage>, anyhow::Err
         match msg.role.as_str() {
             "user" => push_user_messages(&mut out, &blocks),
             "assistant" => push_assistant_message(&mut out, &blocks),
+            // Claude Code occasionally injects system-role entries into the
+            // messages array; map them to Kimi system messages instead of
+            // failing the whole request.
+            "system" => {
+                let text = blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                if !text.is_empty() {
+                    out.push(KimiMessage::System {
+                        role: "system".to_string(),
+                        content: text,
+                    });
+                }
+            }
             other => {
                 anyhow::bail!("unexpected message role: {other}");
             }
@@ -516,6 +535,27 @@ mod tests {
         assert_eq!(translated.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(translated.prompt_cache_key.as_deref(), Some("sid"));
         assert_eq!(translated.max_tokens, 10);
+    }
+
+    #[test]
+    fn translate_system_role_message_in_messages() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "kimi-for-coding",
+            "max_tokens": 10,
+            "system": "outer sys",
+            "messages": [
+                {"role": "system", "content": "inline system"},
+                {"role": "user", "content": "hello"}
+            ]
+        }))
+        .unwrap();
+        let translated = translate_request(&req, TranslateOptions { session_id: None }).unwrap();
+        let serialized = serde_json::to_value(&translated.messages).unwrap();
+        assert_eq!(serialized[0]["role"], "system");
+        assert_eq!(serialized[0]["content"], "outer sys");
+        assert_eq!(serialized[1]["role"], "system");
+        assert_eq!(serialized[1]["content"], "inline system");
+        assert_eq!(serialized[2]["role"], "user");
     }
 
     #[test]
