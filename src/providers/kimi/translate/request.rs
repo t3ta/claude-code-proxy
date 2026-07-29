@@ -369,8 +369,11 @@ fn push_user_messages(out: &mut Vec<KimiMessage>, blocks: &[ContentBlock]) {
     flush_buffer(out, &mut buffer);
 }
 
+// OpenAI-compatible content parts require an explicit "type" discriminator;
+// untagged serialization drops it and Kimi rejects the message with
+// "invalid part type: ".
 #[derive(Debug, Clone, Serialize)]
-#[serde(untagged)]
+#[serde(tag = "type", rename_all = "snake_case")]
 enum KimiUserContentPart {
     Text { text: String },
     ImageUrl { image_url: KimiImageUrl },
@@ -433,8 +436,9 @@ fn tool_result_content(content: &Value, is_error: Option<bool>) -> Value {
     }
 }
 
+// Same "type" discriminator requirement as KimiUserContentPart.
 #[derive(Debug, Clone, Serialize)]
-#[serde(untagged)]
+#[serde(tag = "type", rename_all = "snake_case")]
 enum KimiToolResultPart {
     Text { text: String },
     ImageUrl { image_url: KimiImageUrl },
@@ -637,6 +641,11 @@ mod tests {
                     _ => panic!("expected array"),
                 };
                 assert_eq!(parts.len(), 2);
+                assert_eq!(parts[0].get("type").and_then(|v| v.as_str()), Some("text"));
+                assert_eq!(
+                    parts[1].get("type").and_then(|v| v.as_str()),
+                    Some("image_url")
+                );
                 assert_eq!(
                     parts[1]
                         .get("image_url")
@@ -734,9 +743,14 @@ mod tests {
                 assert!(content.is_array());
                 let parts = content.as_array().unwrap();
                 assert_eq!(parts.len(), 2);
+                assert_eq!(parts[0].get("type").and_then(|v| v.as_str()), Some("text"));
                 assert_eq!(
                     parts[0].get("text").and_then(|v| v.as_str()),
                     Some("describe this")
+                );
+                assert_eq!(
+                    parts[1].get("type").and_then(|v| v.as_str()),
+                    Some("image_url")
                 );
                 assert!(parts[1].get("image_url").is_some());
             }
