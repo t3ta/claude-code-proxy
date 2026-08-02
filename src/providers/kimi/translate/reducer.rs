@@ -157,11 +157,13 @@ struct StreamError {
     r#type: Option<String>,
 }
 
-#[allow(dead_code)]
+// Upstream tool_call deltas are keyed by their position in the OpenAI
+// tool_calls array, while emitted events carry Anthropic content-block
+// indexes; the two diverge as soon as a thinking or text block precedes the
+// first tool call, so the slot must remember both.
 struct ToolSlot {
+    upstream_index: usize,
     block_index: usize,
-    id: String,
-    name: String,
 }
 
 pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, UpstreamStreamError> {
@@ -270,9 +272,9 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
             }
 
             for tc in tool_calls {
-                let existing_pos = tool_slots.iter().position(|s| s.block_index == tc.index);
-                let block_index = if let Some(pos) = existing_pos {
-                    tool_slots[pos].block_index
+                let existing = tool_slots.iter().find(|s| s.upstream_index == tc.index);
+                let block_index = if let Some(slot) = existing {
+                    slot.block_index
                 } else {
                     let id = tc.id.clone().unwrap_or_default();
                     let name = tc
@@ -288,9 +290,8 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                     let bi = next_block_index;
                     next_block_index += 1;
                     tool_slots.push(ToolSlot {
+                        upstream_index: tc.index,
                         block_index: bi,
-                        id: id.clone(),
-                        name: name.clone(),
                     });
                     out.push(ReducerEvent::ToolStart {
                         index: bi,
@@ -492,6 +493,79 @@ mod tests {
         let result = reduce_upstream_bytes(upstream.as_bytes());
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind, UpstreamErrorKind::Failed);
+    }
+
+    #[test]
+    fn reducer_keeps_split_tool_args_when_thinking_precedes() {
+        // The thinking block consumes content-block index 0, so the tool call's
+        // block index (1) no longer equals its upstream index (0). Argument
+        // fragments streamed in later chunks must still land on the tool block.
+        let upstream = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\"\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\":\\\"ls\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let events = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
+        let tool_index = events
+            .iter()
+            .find_map(|e| match e {
+                ReducerEvent::ToolStart { index, .. } => Some(*index),
+                _ => None,
+            })
+            .unwrap();
+        let args: String = events
+            .iter()
+            .filter_map(|e| match e {
+                ReducerEvent::ToolDelta {
+                    index,
+                    partial_json,
+                } if *index == tool_index => Some(partial_json.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(args, "{\"command\":\"ls\"}");
+    }
+
+    #[test]
+    fn reducer_keeps_parallel_tool_calls_separate_after_thinking() {
+        let upstream = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\"\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\":\\\"ls\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_b\",\"function\":{\"name\":\"glob\",\"arguments\":\"{\\\"pattern\\\"\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arguments\":\":\\\"*.rs\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let events = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
+        let starts: Vec<(usize, &str)> = events
+            .iter()
+            .filter_map(|e| match e {
+                ReducerEvent::ToolStart { index, name, .. } => Some((*index, name.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts.len(), 2);
+        let args_for = |target: usize| -> String {
+            events
+                .iter()
+                .filter_map(|e| match e {
+                    ReducerEvent::ToolDelta {
+                        index,
+                        partial_json,
+                    } if *index == target => Some(partial_json.as_str()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let (bash_index, bash_name) = starts[0];
+        let (glob_index, glob_name) = starts[1];
+        assert_eq!(bash_name, "bash");
+        assert_eq!(glob_name, "glob");
+        assert_eq!(args_for(bash_index), "{\"command\":\"ls\"}");
+        assert_eq!(args_for(glob_index), "{\"pattern\":\"*.rs\"}");
     }
 
     #[test]

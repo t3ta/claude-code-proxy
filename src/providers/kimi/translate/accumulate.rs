@@ -203,6 +203,35 @@ mod tests {
     }
 
     #[test]
+    fn accumulate_pairs_tool_names_with_own_args_after_thinking() {
+        // Regression: tool_call deltas are keyed by upstream index, which is
+        // offset from the content-block index once a thinking block exists.
+        // Split argument fragments used to be dropped (empty input) or glued
+        // onto a neighboring tool call.
+        let upstream = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"plan\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\"\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\":\\\"git log\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_b\",\"function\":{\"name\":\"glob\",\"arguments\":\"{\\\"pattern\\\"\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arguments\":\":\\\"*.md\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let response =
+            accumulate_response(upstream.as_bytes(), "msg_2", "kimi-for-coding").unwrap();
+        let content = response["content"].as_array().unwrap();
+        let tools: Vec<&Value> = content
+            .iter()
+            .filter(|c| c["type"] == "tool_use")
+            .collect();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["name"], "bash");
+        assert_eq!(tools[0]["input"], serde_json::json!({"command": "git log"}));
+        assert_eq!(tools[1]["name"], "glob");
+        assert_eq!(tools[1]["input"], serde_json::json!({"pattern": "*.md"}));
+    }
+
+    #[test]
     fn accumulate_handles_upstream_error() {
         let upstream = "data: {\"error\":{\"message\":\"upstream failure\"}}\n\n";
         let result = accumulate_response(upstream.as_bytes(), "msg_e", "model");
