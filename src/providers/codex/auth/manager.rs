@@ -1,6 +1,5 @@
 use std::sync::Arc;
 use std::sync::LazyLock;
-#[cfg(test)]
 use std::sync::Mutex;
 use std::sync::RwLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -30,6 +29,11 @@ pub struct CodexAuthManager<S: AuthStorage<StoredAuth>> {
     refresh_lock: Arc<AsyncMutex<()>>,
     // Value plus the timestamp (ms) it was read from the durable store.
     auth_cache: RwLock<Option<(StoredAuth, u64)>>,
+    // Serializes the cache-miss path. Without it a burst that all misses the
+    // cache performs one durable read per caller, which on macOS is one
+    // `/usr/bin/security` child each — the FD exhaustion the cache exists to
+    // prevent. Held only around the blocking store read, never across an await.
+    load_lock: Mutex<()>,
     cache_ttl_ms: u64,
     refresh_client: reqwest::Client,
     token_endpoint: String,
@@ -56,6 +60,7 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
             test_auth: Arc::new(Mutex::new(None)),
             refresh_lock: CODEX_REFRESH_LOCK.clone(),
             auth_cache: RwLock::new(None),
+            load_lock: Mutex::new(()),
             cache_ttl_ms,
             refresh_client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(15))
@@ -125,6 +130,15 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
         // does not spawn one `/usr/bin/security` child per request (see
         // AUTH_CACHE_TTL_MS). The cache is write-through on our own rotations, so
         // freshly refreshed tokens are visible immediately regardless of TTL.
+        if let Some(auth) = self.cache_get() {
+            return Ok(Some(auth));
+        }
+
+        // Collapse a concurrent miss burst onto a single durable read. A
+        // poisoned lock still grants access: serializing is an optimization, and
+        // failing auth outright would be worse than an extra keychain read.
+        let _load_guard = self.load_lock.lock().unwrap_or_else(|e| e.into_inner());
+        // Another caller may have filled the cache while we waited for the lock.
         if let Some(auth) = self.cache_get() {
             return Ok(Some(auth));
         }
@@ -259,6 +273,74 @@ mod tests {
 
     fn test_store() -> CodexTokenStore<InMemoryAuthStore<StoredAuth>> {
         CodexTokenStore::new(InMemoryAuthStore::new())
+    }
+
+    // Counts durable reads so the single-flight behaviour can be observed. The
+    // sleep stands in for the `/usr/bin/security` child a real keychain read
+    // spawns, which is what made a concurrent miss burst expensive.
+    #[derive(Clone)]
+    struct CountingStore {
+        inner: InMemoryAuthStore<StoredAuth>,
+        loads: Arc<AtomicUsize>,
+    }
+
+    impl AuthStorage<StoredAuth> for CountingStore {
+        fn load(&self) -> anyhow::Result<Option<StoredAuth>> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            thread::sleep(std::time::Duration::from_millis(30));
+            self.inner.load()
+        }
+
+        fn save(&self, value: StoredAuth) -> anyhow::Result<()> {
+            self.inner.save(value)
+        }
+
+        fn clear(&self) -> anyhow::Result<()> {
+            self.inner.clear()
+        }
+
+        fn path(&self) -> String {
+            self.inner.path()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_cache_misses_read_the_store_once() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let store = CodexTokenStore::new(CountingStore {
+            inner: InMemoryAuthStore::new(),
+            loads: loads.clone(),
+        });
+        store
+            .save_auth(StoredAuth {
+                access: "test_access".into(),
+                refresh: "test_refresh".into(),
+                expires: 9999999999999,
+                account_id: Some("acct_1".into()),
+            })
+            .unwrap();
+        // save_auth writes through the store, so only count the reads that follow.
+        loads.store(0, Ordering::SeqCst);
+
+        let manager = Arc::new(CodexAuthManager::new(store));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let manager = manager.clone();
+            handles.push(tokio::task::spawn_blocking(move || {
+                manager.load_auth().unwrap().unwrap().access
+            }));
+        }
+        for handle in handles {
+            assert_eq!(handle.await.unwrap(), "test_access");
+        }
+
+        // Without the single-flight lock every caller misses the cold cache and
+        // performs its own durable read.
+        assert_eq!(
+            loads.load(Ordering::SeqCst),
+            1,
+            "concurrent cache misses each read the durable store"
+        );
     }
 
     #[tokio::test]
