@@ -222,6 +222,22 @@ impl CodexProvider {
             }
         };
 
+        // Gate upstream concurrency before anything reaches the upstream. Server
+        // compaction posts to the same path below, so acquiring after it would
+        // let a compaction request start outside the cap and allow one more
+        // connection than configured.
+        //
+        // On the buffered path the permit is held for the rest of this call and
+        // dropped on return via RAII. On the streaming path it is handed to the
+        // response-stream task instead, because that task keeps the upstream
+        // connection open after this handler returns its first chunk; dropping it
+        // here would let more than the cap's worth of long-running streams stay
+        // connected.
+        let mut upstream_permit = match &self.limiter {
+            Some(sem) => sem.clone().acquire_owned().await.ok(),
+            None => None,
+        };
+
         let compact_boundary = is_compact_messages_request(&body);
         let server_compaction_enabled = config::codex_server_compaction();
         let mut compaction_attempt = None;
@@ -289,17 +305,6 @@ impl CodexProvider {
             previous_response_id_enabled,
         );
         let turn_id = continuation.turn_id();
-
-        // Gate upstream concurrency. On the buffered path the permit is held for
-        // the rest of this call and dropped on return via RAII. On the streaming
-        // path it is handed to the response-stream task instead, because that
-        // task keeps the upstream connection open after this handler returns its
-        // first chunk; dropping it here would let more than the cap's worth of
-        // long-running streams stay connected.
-        let mut upstream_permit = match &self.limiter {
-            Some(sem) => sem.clone().acquire_owned().await.ok(),
-            None => None,
-        };
 
         let configured_transport = config::codex_transport();
         let transport = configured_transport.as_str();
