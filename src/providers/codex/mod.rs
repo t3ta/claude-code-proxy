@@ -74,6 +74,10 @@ pub(crate) fn clear_session_compaction(session_id: &str) {
 
 pub struct CodexProvider {
     client: Arc<CodexHttpClient>,
+    // Caps concurrent upstream request starts to avoid tripping ChatGPT's
+    // per-account concurrency limit (which returns 401 at the WS handshake).
+    // None means no cap. See config::codex_max_concurrent.
+    limiter: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl Default for CodexProvider {
@@ -86,6 +90,8 @@ impl CodexProvider {
     pub fn new() -> Self {
         Self {
             client: Arc::new(CodexHttpClient::new()),
+            limiter: config::codex_max_concurrent()
+                .map(|permits| Arc::new(tokio::sync::Semaphore::new(permits))),
         }
     }
 }
@@ -216,6 +222,22 @@ impl CodexProvider {
             }
         };
 
+        // Gate upstream concurrency before anything reaches the upstream. Server
+        // compaction posts to the same path below, so acquiring after it would
+        // let a compaction request start outside the cap and allow one more
+        // connection than configured.
+        //
+        // On the buffered path the permit is held for the rest of this call and
+        // dropped on return via RAII. On the streaming path it is handed to the
+        // response-stream task instead, because that task keeps the upstream
+        // connection open after this handler returns its first chunk; dropping it
+        // here would let more than the cap's worth of long-running streams stay
+        // connected.
+        let mut upstream_permit = match &self.limiter {
+            Some(sem) => sem.clone().acquire_owned().await.ok(),
+            None => None,
+        };
+
         let compact_boundary = is_compact_messages_request(&body);
         let server_compaction_enabled = config::codex_server_compaction();
         let mut compaction_attempt = None;
@@ -283,6 +305,7 @@ impl CodexProvider {
             previous_response_id_enabled,
         );
         let turn_id = continuation.turn_id();
+
         let configured_transport = config::codex_transport();
         let transport = configured_transport.as_str();
         let upstream_started_at = Instant::now();
@@ -334,6 +357,7 @@ impl CodexProvider {
                     attempt: compaction_attempt,
                 },
                 configured_transport,
+                upstream_permit.take(),
             )
             .await;
             log.info(
@@ -714,6 +738,9 @@ async fn live_stream_response(
     continuation: ContinuationReservation,
     compaction: LiveStreamCompaction,
     transport: config::CodexTransport,
+    // Passed by value and moved into the response-stream task when one starts.
+    // Retries reuse it, so it is only consumed once a stream actually begins.
+    mut upstream_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Response {
     let model = model.to_string();
     let request_continuation = continuation.clone();
@@ -786,6 +813,7 @@ async fn live_stream_response(
             request_continuation.clone(),
             request_body.clone(),
             compaction,
+            &mut upstream_permit,
         )
         .await
         {
@@ -851,6 +879,7 @@ async fn live_stream_response_once(
     request_continuation: ContinuationReservation,
     request_body: translate::request::ResponsesRequest,
     compaction: LiveStreamCompaction,
+    upstream_permit: &mut Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> LiveStreamStart {
     let estimated_input_tokens = count_translated_tokens(&request_body);
     let mut translator = LiveStreamTranslator::with_estimated_input_tokens(
@@ -948,6 +977,7 @@ async fn live_stream_response_once(
                 request_body,
                 upstream_sse_body,
                 compaction,
+                upstream_permit.take(),
             ));
         }
         if terminal {
@@ -1059,9 +1089,16 @@ fn remaining_live_stream_response(
     request_body: translate::request::ResponsesRequest,
     mut upstream_sse_body: Vec<u8>,
     compaction: LiveStreamCompaction,
+    // Held for the lifetime of the spawned task so the concurrency cap counts
+    // this stream until the upstream ends or the client disconnects.
+    upstream_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     tokio::spawn(async move {
+        // Keep the permit alive for the whole stream. Dropping it when the
+        // handler returned its first chunk is what let the cap undercount
+        // still-connected upstreams.
+        let _upstream_permit = upstream_permit;
         if tx.send(Ok(Bytes::from(first_chunk))).await.is_err() {
             abort_request_state(
                 ctx.session_id.as_deref(),
@@ -1925,6 +1962,7 @@ mod tests {
                 compact_boundary: false,
                 attempt: None,
             },
+            &mut None,
         )
         .await
         {
@@ -2190,6 +2228,7 @@ mod tests {
                     attempt: Some(compaction_attempt),
                 },
                 config::CodexTransport::WebSocket,
+                None,
             ),
         )
         .await
@@ -2258,6 +2297,7 @@ mod tests {
                     attempt: Some(compaction_attempt),
                 },
                 config::CodexTransport::WebSocket,
+                None,
             )
             .await
         });
@@ -2329,6 +2369,9 @@ mod tests {
         });
         let client = authenticated_live_test_client(format!("http://{addr}/responses"));
 
+        let permit_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = permit_sem.clone().acquire_owned().await.ok();
+
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             live_stream_response(
@@ -2343,10 +2386,21 @@ mod tests {
                     attempt: Some(compaction_attempt),
                 },
                 config::CodexTransport::WebSocket,
+                permit,
             ),
         )
         .await
         .expect("live response did not publish the first chunk");
+
+        // The handler has returned, but the upstream stream is still live in the
+        // spawned task, so the permit must still be held. Releasing it here is
+        // what let more than the cap's worth of streams stay connected.
+        assert_eq!(
+            permit_sem.available_permits(),
+            0,
+            "the concurrency permit was released when the handler returned its first chunk"
+        );
+
         let mut body = response.into_body();
         tokio::time::timeout(std::time::Duration::from_secs(1), body.frame())
             .await
@@ -2359,6 +2413,13 @@ mod tests {
             .await
             .expect("dropping the downstream body did not close the upstream socket")
             .expect("socket-close acknowledgement sender dropped");
+
+        // Once the stream task finishes the permit returns to the semaphore.
+        let _reacquired =
+            tokio::time::timeout(std::time::Duration::from_secs(2), permit_sem.acquire())
+                .await
+                .expect("the concurrency permit was not released after the stream ended")
+                .expect("semaphore closed unexpectedly");
         assert!(!continuation::is_current_turn_for_owner(&continuation));
         assert!(!store_compaction(
             session_id,
@@ -2526,6 +2587,7 @@ mod tests {
                     attempt: Some(compaction_attempt),
                 },
                 config::CodexTransport::WebSocket,
+                None,
             )
             .await
         });

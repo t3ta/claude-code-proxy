@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::LazyLock;
-#[cfg(test)]
 use std::sync::Mutex;
+use std::sync::RwLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -13,26 +13,55 @@ use crate::auth::AuthStorage;
 static CODEX_REFRESH_LOCK: LazyLock<Arc<AsyncMutex<()>>> =
     LazyLock::new(|| Arc::new(AsyncMutex::new(())));
 
+// How long a keychain read is trusted before the durable store is consulted
+// again. On macOS every `load_auth` spawns a `/usr/bin/security` child to read
+// the Keychain; without this cache each incoming request spawns one, so a burst
+// of concurrent requests exhausts the process file-descriptor limit (EMFILE),
+// fails auth with a spurious 401, and can take down the listener. Holding the
+// value for a few seconds collapses a concurrent burst onto a single read while
+// still letting an out-of-process re-login be observed shortly after.
+const AUTH_CACHE_TTL_MS: u64 = 5_000;
+
 pub struct CodexAuthManager<S: AuthStorage<StoredAuth>> {
     pub store: CodexTokenStore<S>,
     #[cfg(test)]
     test_auth: Arc<Mutex<Option<StoredAuth>>>,
     refresh_lock: Arc<AsyncMutex<()>>,
+    // Value plus the timestamp (ms) it was read from the durable store.
+    auth_cache: RwLock<Option<(StoredAuth, u64)>>,
+    // Serializes the cache-miss path. Without it a burst that all misses the
+    // cache performs one durable read per caller, which on macOS is one
+    // `/usr/bin/security` child each — the FD exhaustion the cache exists to
+    // prevent. Held only around the blocking store read, never across an await.
+    load_lock: Mutex<()>,
+    cache_ttl_ms: u64,
     refresh_client: reqwest::Client,
     token_endpoint: String,
 }
 
 impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
     pub fn new(store: CodexTokenStore<S>) -> Self {
-        Self::new_with_token_endpoint(store, format!("{ISSUER}/oauth/token"))
+        Self::new_with_config(store, format!("{ISSUER}/oauth/token"), AUTH_CACHE_TTL_MS)
     }
 
+    #[cfg(test)]
     fn new_with_token_endpoint(store: CodexTokenStore<S>, token_endpoint: String) -> Self {
+        Self::new_with_config(store, token_endpoint, AUTH_CACHE_TTL_MS)
+    }
+
+    fn new_with_config(
+        store: CodexTokenStore<S>,
+        token_endpoint: String,
+        cache_ttl_ms: u64,
+    ) -> Self {
         Self {
             store,
             #[cfg(test)]
             test_auth: Arc::new(Mutex::new(None)),
             refresh_lock: CODEX_REFRESH_LOCK.clone(),
+            auth_cache: RwLock::new(None),
+            load_lock: Mutex::new(()),
+            cache_ttl_ms,
             refresh_client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(15))
                 .timeout(Duration::from_secs(30))
@@ -40,6 +69,27 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
                 .expect("failed to create Codex OAuth refresh client"),
             token_endpoint,
         }
+    }
+
+    fn cache_store(&self, auth: StoredAuth) {
+        if let Ok(mut guard) = self.auth_cache.write() {
+            *guard = Some((auth, Self::now_ms()));
+        }
+    }
+
+    fn cache_clear(&self) {
+        if let Ok(mut guard) = self.auth_cache.write() {
+            *guard = None;
+        }
+    }
+
+    fn cache_get(&self) -> Option<StoredAuth> {
+        if self.cache_ttl_ms == 0 {
+            return None;
+        }
+        let guard = self.auth_cache.read().ok()?;
+        let (auth, loaded_at) = guard.as_ref()?;
+        (Self::now_ms().saturating_sub(*loaded_at) < self.cache_ttl_ms).then(|| auth.clone())
     }
 
     fn now_ms() -> u64 {
@@ -76,7 +126,29 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
             return Ok(Some(auth));
         }
 
-        self.store.load_auth()
+        // Serve a recent keychain read from memory so a concurrent request burst
+        // does not spawn one `/usr/bin/security` child per request (see
+        // AUTH_CACHE_TTL_MS). The cache is write-through on our own rotations, so
+        // freshly refreshed tokens are visible immediately regardless of TTL.
+        if let Some(auth) = self.cache_get() {
+            return Ok(Some(auth));
+        }
+
+        // Collapse a concurrent miss burst onto a single durable read. A
+        // poisoned lock still grants access: serializing is an optimization, and
+        // failing auth outright would be worse than an extra keychain read.
+        let _load_guard = self.load_lock.lock().unwrap_or_else(|e| e.into_inner());
+        // Another caller may have filled the cache while we waited for the lock.
+        if let Some(auth) = self.cache_get() {
+            return Ok(Some(auth));
+        }
+
+        let loaded = self.store.load_auth()?;
+        match &loaded {
+            Some(auth) => self.cache_store(auth.clone()),
+            None => self.cache_clear(),
+        }
+        Ok(loaded)
     }
 
     async fn refresh(
@@ -123,12 +195,17 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
 
         let status = resp.status().as_u16();
         if status == 401 || status == 403 {
+            // Read the durable store directly (not the cache): another actor may
+            // have rotated the token out of band, and that is exactly the case
+            // this recovery path exists to detect.
             if let Some(latest) = self.store.load_auth()?
                 && latest != *current
             {
+                self.cache_store(latest.clone());
                 return Ok(latest);
             }
             self.store.clear_auth()?;
+            self.cache_clear();
             let err_msg = resp
                 .text()
                 .await
@@ -154,6 +231,7 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
             account_id,
         };
         self.store.save_auth(next.clone())?;
+        self.cache_store(next.clone());
         Ok(next)
     }
 
@@ -171,6 +249,7 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
             account_id,
         };
         self.store.save_auth(auth.clone())?;
+        self.cache_store(auth.clone());
         Ok(auth)
     }
 
@@ -194,6 +273,74 @@ mod tests {
 
     fn test_store() -> CodexTokenStore<InMemoryAuthStore<StoredAuth>> {
         CodexTokenStore::new(InMemoryAuthStore::new())
+    }
+
+    // Counts durable reads so the single-flight behaviour can be observed. The
+    // sleep stands in for the `/usr/bin/security` child a real keychain read
+    // spawns, which is what made a concurrent miss burst expensive.
+    #[derive(Clone)]
+    struct CountingStore {
+        inner: InMemoryAuthStore<StoredAuth>,
+        loads: Arc<AtomicUsize>,
+    }
+
+    impl AuthStorage<StoredAuth> for CountingStore {
+        fn load(&self) -> anyhow::Result<Option<StoredAuth>> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            thread::sleep(std::time::Duration::from_millis(30));
+            self.inner.load()
+        }
+
+        fn save(&self, value: StoredAuth) -> anyhow::Result<()> {
+            self.inner.save(value)
+        }
+
+        fn clear(&self) -> anyhow::Result<()> {
+            self.inner.clear()
+        }
+
+        fn path(&self) -> String {
+            self.inner.path()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_cache_misses_read_the_store_once() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let store = CodexTokenStore::new(CountingStore {
+            inner: InMemoryAuthStore::new(),
+            loads: loads.clone(),
+        });
+        store
+            .save_auth(StoredAuth {
+                access: "test_access".into(),
+                refresh: "test_refresh".into(),
+                expires: 9999999999999,
+                account_id: Some("acct_1".into()),
+            })
+            .unwrap();
+        // save_auth writes through the store, so only count the reads that follow.
+        loads.store(0, Ordering::SeqCst);
+
+        let manager = Arc::new(CodexAuthManager::new(store));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let manager = manager.clone();
+            handles.push(tokio::task::spawn_blocking(move || {
+                manager.load_auth().unwrap().unwrap().access
+            }));
+        }
+        for handle in handles {
+            assert_eq!(handle.await.unwrap(), "test_access");
+        }
+
+        // Without the single-flight lock every caller misses the cold cache and
+        // performs its own durable read.
+        assert_eq!(
+            loads.load(Ordering::SeqCst),
+            1,
+            "concurrent cache misses each read the durable store"
+        );
     }
 
     #[tokio::test]
@@ -350,7 +497,9 @@ mod tests {
                 account_id: Some("acct_1".into()),
             })
             .unwrap();
-        let manager = CodexAuthManager::new(store);
+        // TTL 0 disables the in-memory cache so this test can assert that
+        // out-of-band durable writes are observed on the very next read.
+        let manager = CodexAuthManager::new_with_config(store, format!("{ISSUER}/oauth/token"), 0);
         assert_eq!(manager.get_auth().await.unwrap().access, "first");
 
         manager
@@ -368,5 +517,38 @@ mod tests {
 
         manager.store.clear_auth().unwrap();
         assert!(manager.get_auth().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn valid_auth_is_served_from_cache_within_ttl() {
+        // With the default TTL the manager must reuse the first read instead of
+        // hitting the durable store (a `/usr/bin/security` spawn on macOS) again.
+        // We prove the cache is live by rotating the store out of band and
+        // confirming the cached value is still returned within the TTL window.
+        let store = test_store();
+        store
+            .save_auth(StoredAuth {
+                access: "cached".into(),
+                refresh: "cached-refresh".into(),
+                expires: u64::MAX,
+                account_id: Some("acct_1".into()),
+            })
+            .unwrap();
+        let manager = CodexAuthManager::new(store);
+        assert_eq!(manager.get_auth().await.unwrap().access, "cached");
+
+        // Out-of-band durable rotation is intentionally NOT observed within the
+        // TTL; the running proxy is the only writer and updates the cache
+        // write-through on its own rotations.
+        manager
+            .store
+            .save_auth(StoredAuth {
+                access: "rotated-out-of-band".into(),
+                refresh: "r".into(),
+                expires: u64::MAX,
+                account_id: Some("acct_1".into()),
+            })
+            .unwrap();
+        assert_eq!(manager.get_auth().await.unwrap().access, "cached");
     }
 }
