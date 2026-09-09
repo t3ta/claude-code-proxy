@@ -74,6 +74,10 @@ pub(crate) fn clear_session_compaction(session_id: &str) {
 
 pub struct CodexProvider {
     client: Arc<CodexHttpClient>,
+    // Caps concurrent upstream request starts to avoid tripping ChatGPT's
+    // per-account concurrency limit (which returns 401 at the WS handshake).
+    // None means no cap. See config::codex_max_concurrent.
+    limiter: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl Default for CodexProvider {
@@ -86,6 +90,8 @@ impl CodexProvider {
     pub fn new() -> Self {
         Self {
             client: Arc::new(CodexHttpClient::new()),
+            limiter: config::codex_max_concurrent()
+                .map(|permits| Arc::new(tokio::sync::Semaphore::new(permits))),
         }
     }
 }
@@ -283,6 +289,16 @@ impl CodexProvider {
             previous_response_id_enabled,
         );
         let turn_id = continuation.turn_id();
+
+        // Gate upstream concurrency. The permit is held for the rest of this
+        // call and dropped on return via RAII, so it is released whether we take
+        // the streaming or buffered path and cannot leak even if the caller
+        // disconnects mid-handshake.
+        let _upstream_permit = match &self.limiter {
+            Some(sem) => sem.clone().acquire_owned().await.ok(),
+            None => None,
+        };
+
         let configured_transport = config::codex_transport();
         let transport = configured_transport.as_str();
         let upstream_started_at = Instant::now();
