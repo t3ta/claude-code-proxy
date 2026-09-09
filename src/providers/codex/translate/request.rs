@@ -545,31 +545,87 @@ fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyho
     }
 }
 
+/// JSON Schema keywords whose value is a single subschema.
+const SUBSCHEMA_KEYS: &[&str] = &[
+    "additionalItems",
+    "additionalProperties",
+    "contains",
+    "else",
+    "if",
+    "not",
+    "propertyNames",
+    "then",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+];
+
+/// JSON Schema keywords whose value maps names to subschemas.
+const SUBSCHEMA_MAP_KEYS: &[&str] = &[
+    "$defs",
+    "definitions",
+    "dependentSchemas",
+    "patternProperties",
+    "properties",
+];
+
+/// JSON Schema keywords whose value is a list of subschemas.
+const SUBSCHEMA_LIST_KEYS: &[&str] = &["allOf", "anyOf", "oneOf", "prefixItems"];
+
 /// The Responses API validates tool schemas and rejects any `pattern` that uses
 /// Unicode property escapes (`\p{...}` / `\P{...}`) with
 /// `Invalid schema for function '<name>': ... is not a 'regex'`, which fails the
 /// whole request. A `pattern` only constrains arguments the model produces, so
 /// dropping the unsupported ones keeps the tool usable instead of losing the turn.
+///
+/// Only keywords whose values are subschemas are traversed. `enum`, `const`,
+/// `default` and `examples` hold instance data, where a `pattern` key is an
+/// allowed argument value rather than a constraint, so rewriting it would change
+/// what the tool accepts.
 fn strip_unsupported_patterns(schema: &mut Value) {
-    match schema {
-        Value::Array(items) => {
-            for item in items {
-                strip_unsupported_patterns(item);
+    let Some(map) = schema.as_object_mut() else {
+        return;
+    };
+
+    if map
+        .get("pattern")
+        .and_then(Value::as_str)
+        .is_some_and(uses_unicode_property_escape)
+    {
+        map.remove("pattern");
+    }
+
+    // `items` holds a single schema in 2020-12 and a tuple of schemas in draft-07.
+    if let Some(items) = map.get_mut("items") {
+        match items {
+            Value::Array(entries) => {
+                for entry in entries {
+                    strip_unsupported_patterns(entry);
+                }
             }
+            other => strip_unsupported_patterns(other),
         }
-        Value::Object(map) => {
-            if map
-                .get("pattern")
-                .and_then(Value::as_str)
-                .is_some_and(uses_unicode_property_escape)
-            {
-                map.remove("pattern");
-            }
-            for value in map.values_mut() {
+    }
+
+    for key in SUBSCHEMA_KEYS {
+        if let Some(value) = map.get_mut(*key) {
+            strip_unsupported_patterns(value);
+        }
+    }
+
+    for key in SUBSCHEMA_MAP_KEYS {
+        if let Some(Value::Object(entries)) = map.get_mut(*key) {
+            for value in entries.values_mut() {
                 strip_unsupported_patterns(value);
             }
         }
-        _ => {}
+    }
+
+    for key in SUBSCHEMA_LIST_KEYS {
+        if let Some(Value::Array(entries)) = map.get_mut(*key) {
+            for value in entries {
+                strip_unsupported_patterns(value);
+            }
+        }
     }
 }
 
@@ -1331,6 +1387,136 @@ mod tests {
                 .and_then(|v| v.get("pattern"))
                 .and_then(Value::as_str),
             Some("^(?!\\.\\.?(?:\\/|$))[A-Za-z0-9_\\-.~:@+]{1,200}$")
+        );
+    }
+
+    #[test]
+    fn translate_keeps_instance_data_that_looks_like_a_schema() {
+        // `enum` / `const` / `default` / `examples` hold values the tool accepts,
+        // so a `pattern` key inside them is data and must survive untouched.
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [{"role":"user", "content":"hi"}],
+            "tools": [{
+                "name": "Rule",
+                "description": "Store a matcher.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "preset": {
+                            "enum": [{"pattern": "\\p{L}"}, {"pattern": "^[a-z]$"}],
+                            "default": {"pattern": "\\p{L}"},
+                            "examples": [{"pattern": "\\P{Nd}"}]
+                        },
+                        "fixed": {"const": {"pattern": "\\p{Cc}"}}
+                    }
+                }
+            }]
+        }))
+        .unwrap();
+        let out = translate_request(&req, opts()).unwrap();
+        let tools = out.tools.as_ref().unwrap();
+        let ResponsesTool::Function(tool) = &tools[0] else {
+            panic!("expected function tool");
+        };
+        let preset = tool
+            .parameters
+            .get("properties")
+            .and_then(|v| v.get("preset"))
+            .unwrap();
+
+        assert_eq!(
+            preset.get("enum").unwrap(),
+            &json!([{"pattern": "\\p{L}"}, {"pattern": "^[a-z]$"}])
+        );
+        assert_eq!(
+            preset.get("default").unwrap(),
+            &json!({"pattern": "\\p{L}"})
+        );
+        assert_eq!(
+            preset.get("examples").unwrap(),
+            &json!([{"pattern": "\\P{Nd}"}])
+        );
+        assert_eq!(
+            tool.parameters
+                .get("properties")
+                .and_then(|v| v.get("fixed"))
+                .and_then(|v| v.get("const"))
+                .unwrap(),
+            &json!({"pattern": "\\p{Cc}"})
+        );
+    }
+
+    #[test]
+    fn translate_strips_patterns_in_every_subschema_position() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [{"role":"user", "content":"hi"}],
+            "tools": [{
+                "name": "Nested",
+                "description": "Exercise subschema keywords.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "one_of": {"oneOf": [{"type": "string", "pattern": "^\\p{L}$"}]},
+                        "any_of": {"anyOf": [{"type": "string", "pattern": "^\\p{L}$"}]},
+                        "all_of": {"allOf": [{"type": "string", "pattern": "^\\p{L}$"}]},
+                        "tuple": {"prefixItems": [{"type": "string", "pattern": "^\\p{L}$"}]},
+                        "draft7_tuple": {"items": [{"type": "string", "pattern": "^\\p{L}$"}]},
+                        "free_form": {"additionalProperties": {"type": "string", "pattern": "^\\p{L}$"}},
+                        "keys": {"propertyNames": {"pattern": "^\\p{L}$"}},
+                        "guarded": {
+                            "if": {"pattern": "^\\p{L}$"},
+                            "then": {"pattern": "^\\p{L}$"},
+                            "else": {"pattern": "^\\p{L}$"},
+                            "not": {"pattern": "^\\p{L}$"}
+                        }
+                    },
+                    "$defs": {"named": {"type": "string", "pattern": "^\\p{L}$"}}
+                }
+            }]
+        }))
+        .unwrap();
+        let out = translate_request(&req, opts()).unwrap();
+        let tools = out.tools.as_ref().unwrap();
+        let ResponsesTool::Function(tool) = &tools[0] else {
+            panic!("expected function tool");
+        };
+        let rendered = serde_json::to_string(&tool.parameters).unwrap();
+        assert!(
+            !rendered.contains("p{L}"),
+            "unsupported pattern survived: {rendered}"
+        );
+        // The schema itself is otherwise intact.
+        assert!(rendered.contains("propertyNames"));
+        assert!(rendered.contains("$defs"));
+    }
+
+    #[test]
+    fn translate_leaves_non_schema_tool_parameters_alone() {
+        // A bare `additionalProperties: false` must not be mistaken for a schema.
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [{"role":"user", "content":"hi"}],
+            "tools": [{
+                "name": "Strict",
+                "description": "Closed object.",
+                "input_schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {"a": {"type": "string"}}
+                }
+            }]
+        }))
+        .unwrap();
+        let out = translate_request(&req, opts()).unwrap();
+        let tools = out.tools.as_ref().unwrap();
+        let ResponsesTool::Function(tool) = &tools[0] else {
+            panic!("expected function tool");
+        };
+        assert_eq!(
+            tool.parameters.get("additionalProperties").unwrap(),
+            &Value::Bool(false)
         );
     }
 
