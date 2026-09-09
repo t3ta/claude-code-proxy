@@ -545,6 +545,10 @@ fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyho
     }
 }
 
+/// A `patternProperties` key the Responses API accepts, used to carry a
+/// subschema whose original key it would reject.
+const PERMISSIVE_PATTERN_KEY: &str = "^.*$";
+
 /// JSON Schema keywords whose value is a single subschema.
 const SUBSCHEMA_KEYS: &[&str] = &[
     "additionalItems",
@@ -617,9 +621,14 @@ fn strip_unsupported_patterns(schema: &mut Value) {
     }
 
     // `patternProperties` keys are regular expressions in their own right, so an
-    // unsupported key is rejected exactly like an unsupported `pattern`. Drop the
-    // whole entry: the constraint cannot be expressed upstream either way, and
-    // keeping it would fail the request.
+    // unsupported key is rejected exactly like an unsupported `pattern`. Re-key
+    // the entry instead of dropping it: alongside `additionalProperties: false`
+    // it is the only thing that permits and describes those dynamic properties,
+    // so deleting it can leave a schema that rejects every key it used to allow
+    // and that no valid tool call satisfies. The replacement matches more keys
+    // than the original, which only relaxes a constraint the upstream could not
+    // have enforced anyway. If the permissive key is already present it covers
+    // every key, so the existing subschema is left in place.
     if let Some(Value::Object(entries)) = map.get_mut("patternProperties") {
         let unsupported: Vec<String> = entries
             .keys()
@@ -627,7 +636,10 @@ fn strip_unsupported_patterns(schema: &mut Value) {
             .cloned()
             .collect();
         for key in unsupported {
-            entries.remove(&key);
+            let Some(value) = entries.remove(&key) else {
+                continue;
+            };
+            entries.entry(PERMISSIVE_PATTERN_KEY).or_insert(value);
         }
     }
 
@@ -1533,7 +1545,7 @@ mod tests {
     }
 
     #[test]
-    fn translate_drops_pattern_properties_entries_with_unsupported_keys() {
+    fn translate_rekeys_pattern_properties_entries_with_unsupported_keys() {
         let req: MessagesRequest = serde_json::from_value(json!({
             "model": "gpt-5.5",
             "messages": [{"role":"user", "content":"hi"}],
@@ -1542,11 +1554,12 @@ mod tests {
                 "description": "Pattern-keyed object.",
                 "input_schema": {
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "bag": {
                             "type": "object",
                             "patternProperties": {
-                                "^\\p{L}+$": {"type": "string"},
+                                "^\\p{L}+$": {"type": "string", "description": "dynamic"},
                                 "^[a-z]+$": {"type": "string", "pattern": "^\\p{Nd}$"}
                             }
                         }
@@ -1568,13 +1581,62 @@ mod tests {
             .and_then(Value::as_object)
             .unwrap();
 
-        // The unsupported key is a regex the upstream validator rejects, so the
-        // whole entry goes.
+        // The unsupported key is gone, but its subschema still permits and
+        // describes those dynamic properties under a key the API accepts.
         assert!(!entries.contains_key("^\\p{L}+$"));
+        assert_eq!(
+            entries.get("^.*$").unwrap(),
+            &json!({"type": "string", "description": "dynamic"})
+        );
         // A supported key stays, and its subschema is still sanitized.
         let kept = entries.get("^[a-z]+$").unwrap();
         assert_eq!(kept.get("type").and_then(Value::as_str), Some("string"));
         assert!(kept.get("pattern").is_none());
+    }
+
+    #[test]
+    fn translate_keeps_existing_permissive_pattern_properties_entry() {
+        // When the permissive key is already present it matches every key the
+        // unsupported entry did, so the existing subschema is left alone.
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [{"role":"user", "content":"hi"}],
+            "tools": [{
+                "name": "Keyed",
+                "description": "Pattern-keyed object.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "bag": {
+                            "type": "object",
+                            "patternProperties": {
+                                "^\\p{L}+$": {"type": "string", "description": "dropped"},
+                                "^.*$": {"type": "string", "description": "existing"}
+                            }
+                        }
+                    }
+                }
+            }]
+        }))
+        .unwrap();
+        let out = translate_request(&req, opts()).unwrap();
+        let tools = out.tools.as_ref().unwrap();
+        let ResponsesTool::Function(tool) = &tools[0] else {
+            panic!("expected function tool");
+        };
+        let entries = tool
+            .parameters
+            .get("properties")
+            .and_then(|v| v.get("bag"))
+            .and_then(|v| v.get("patternProperties"))
+            .and_then(Value::as_object)
+            .unwrap();
+
+        assert!(!entries.contains_key("^\\p{L}+$"));
+        assert_eq!(
+            entries.get("^.*$").unwrap(),
+            &json!({"type": "string", "description": "existing"})
+        );
     }
 
     #[test]
