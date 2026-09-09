@@ -527,7 +527,8 @@ fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyho
                 .cloned()
                 .unwrap_or(serde_json::json!({}));
             let description = codex_tool_description(&name, description);
-            let parameters = codex_tool_parameters(&name, parameters);
+            let mut parameters = codex_tool_parameters(&name, parameters);
+            strip_unsupported_patterns(&mut parameters);
             out.push(ResponsesTool::Function(ResponsesFunctionTool {
                 kind: "function".to_string(),
                 name,
@@ -542,6 +543,52 @@ fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyho
     } else {
         Ok(Some(out))
     }
+}
+
+/// The Responses API validates tool schemas and rejects any `pattern` that uses
+/// Unicode property escapes (`\p{...}` / `\P{...}`) with
+/// `Invalid schema for function '<name>': ... is not a 'regex'`, which fails the
+/// whole request. A `pattern` only constrains arguments the model produces, so
+/// dropping the unsupported ones keeps the tool usable instead of losing the turn.
+fn strip_unsupported_patterns(schema: &mut Value) {
+    match schema {
+        Value::Array(items) => {
+            for item in items {
+                strip_unsupported_patterns(item);
+            }
+        }
+        Value::Object(map) => {
+            if map
+                .get("pattern")
+                .and_then(Value::as_str)
+                .is_some_and(uses_unicode_property_escape)
+            {
+                map.remove("pattern");
+            }
+            for value in map.values_mut() {
+                strip_unsupported_patterns(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn uses_unicode_property_escape(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            i += 1;
+            continue;
+        }
+        // A backslash consumes the byte after it, so `\\p{L}` is a literal
+        // backslash followed by `p` rather than a property escape.
+        match bytes.get(i + 1) {
+            Some(b'p') | Some(b'P') => return true,
+            _ => i += 2,
+        }
+    }
+    false
 }
 
 fn codex_tool_description(name: &str, description: Option<String>) -> Option<String> {
@@ -1204,6 +1251,99 @@ mod tests {
                 .and_then(Value::as_str),
             Some("record offset")
         );
+    }
+
+    #[test]
+    fn translate_drops_tool_patterns_with_unicode_property_escapes() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [{"role":"user", "content":"publish it"}],
+            "tools": [{
+                "name": "Artifact",
+                "description": "Render an HTML file to an Artifact.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "field": {
+                            "type": "string",
+                            "pattern": "^(?!__.*__$)[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}\"\\\\./[\\]]{1,200}$"
+                        },
+                        "asset_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+                        "doc_id": {
+                            "type": "string",
+                            "pattern": "^(?!\\.\\.?(?:\\/|$))[A-Za-z0-9_\\-.~:@+]{1,200}$"
+                        },
+                        "writes": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "collection": {"type": "string", "pattern": "^\\P{Cc}{1,200}$"}
+                                }
+                            }
+                        }
+                    }
+                }
+            }]
+        }))
+        .unwrap();
+        let out = translate_request(&req, opts()).unwrap();
+        let tools = out.tools.as_ref().unwrap();
+        let ResponsesTool::Function(tool) = &tools[0] else {
+            panic!("expected function tool");
+        };
+        let props = tool
+            .parameters
+            .get("properties")
+            .and_then(Value::as_object)
+            .unwrap();
+
+        // Unsupported patterns are dropped, but the property they constrained stays.
+        assert!(props.get("field").and_then(|v| v.get("pattern")).is_none());
+        assert_eq!(
+            props
+                .get("field")
+                .and_then(|v| v.get("type"))
+                .and_then(Value::as_str),
+            Some("string")
+        );
+        assert!(
+            props
+                .get("writes")
+                .and_then(|v| v.get("items"))
+                .and_then(|v| v.get("properties"))
+                .and_then(|v| v.get("collection"))
+                .and_then(|v| v.get("pattern"))
+                .is_none()
+        );
+
+        // Patterns the Responses API accepts are left alone, lookaheads included.
+        assert_eq!(
+            props
+                .get("asset_id")
+                .and_then(|v| v.get("pattern"))
+                .and_then(Value::as_str),
+            Some("^[0-9a-f]{32}$")
+        );
+        assert_eq!(
+            props
+                .get("doc_id")
+                .and_then(|v| v.get("pattern"))
+                .and_then(Value::as_str),
+            Some("^(?!\\.\\.?(?:\\/|$))[A-Za-z0-9_\\-.~:@+]{1,200}$")
+        );
+    }
+
+    #[test]
+    fn unicode_property_escape_detection_ignores_literal_backslash() {
+        assert!(uses_unicode_property_escape("^\\p{L}+$"));
+        assert!(uses_unicode_property_escape("^\\P{Cc}$"));
+        assert!(uses_unicode_property_escape("^[^\\p{Cc}]{1,10}$"));
+        assert!(!uses_unicode_property_escape("^[a-z]{1,10}$"));
+        assert!(!uses_unicode_property_escape("^(?!__).{1,10}$"));
+        // A literal backslash followed by `p` is not a property escape.
+        assert!(!uses_unicode_property_escape("^\\\\p{L}$"));
+        assert!(!uses_unicode_property_escape("trailing\\\\"));
     }
 
     #[test]
