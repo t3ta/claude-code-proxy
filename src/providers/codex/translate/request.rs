@@ -674,7 +674,8 @@ fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyho
                 .cloned()
                 .unwrap_or(serde_json::json!({}));
             let description = codex_tool_description(&name, description);
-            let parameters = codex_tool_parameters(&name, parameters);
+            let mut parameters = codex_tool_parameters(&name, parameters);
+            strip_unsupported_patterns(&mut parameters);
             out.push(ResponsesTool::Function(ResponsesFunctionTool {
                 kind: "function".to_string(),
                 name,
@@ -689,6 +690,120 @@ fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyho
     } else {
         Ok(Some(out))
     }
+}
+
+/// JSON Schema keywords whose value is a single subschema.
+const SUBSCHEMA_KEYS: &[&str] = &[
+    "additionalItems",
+    "additionalProperties",
+    "contains",
+    "contentSchema",
+    "else",
+    "if",
+    "not",
+    "propertyNames",
+    "then",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+];
+
+/// JSON Schema keywords whose value maps names to subschemas. Draft-07's
+/// `dependencies` also maps names to arrays of property names; those are not
+/// objects, so they are skipped without a special case.
+const SUBSCHEMA_MAP_KEYS: &[&str] = &[
+    "$defs",
+    "definitions",
+    "dependencies",
+    "dependentSchemas",
+    "patternProperties",
+    "properties",
+];
+
+/// JSON Schema keywords whose value is a list of subschemas.
+const SUBSCHEMA_LIST_KEYS: &[&str] = &["allOf", "anyOf", "oneOf", "prefixItems"];
+
+/// The Responses API validates tool schemas and rejects any `pattern` that uses
+/// Unicode property escapes (`\p{...}` / `\P{...}`) with
+/// `Invalid schema for function '<name>': ... is not a 'regex'`, which fails the
+/// whole request. A `pattern` only constrains arguments the model produces, so
+/// dropping the unsupported ones keeps the tool usable instead of losing the turn.
+///
+/// Only keywords whose values are subschemas are traversed. `enum`, `const`,
+/// `default` and `examples` hold instance data, where a `pattern` key is an
+/// allowed argument value rather than a constraint, so rewriting it would change
+/// what the tool accepts.
+///
+/// `patternProperties` keys are regular expressions too, and an unsupported one
+/// is rejected the same way. They are still forwarded unchanged, because neither
+/// repair preserves the schema's meaning: dropping the entry can leave a closed
+/// object that rejects every key it used to allow, and re-keying it to a
+/// universal matcher can stack its subschema onto keys a sibling entry already
+/// constrains, making them unsatisfiable. Failing the request is the honest
+/// outcome; a silently misshapen schema is not.
+fn strip_unsupported_patterns(schema: &mut Value) {
+    let Some(map) = schema.as_object_mut() else {
+        return;
+    };
+
+    if map
+        .get("pattern")
+        .and_then(Value::as_str)
+        .is_some_and(uses_unicode_property_escape)
+    {
+        map.remove("pattern");
+    }
+
+    // `items` holds a single schema in 2020-12 and a tuple of schemas in draft-07.
+    if let Some(items) = map.get_mut("items") {
+        match items {
+            Value::Array(entries) => {
+                for entry in entries {
+                    strip_unsupported_patterns(entry);
+                }
+            }
+            other => strip_unsupported_patterns(other),
+        }
+    }
+
+    for key in SUBSCHEMA_KEYS {
+        if let Some(value) = map.get_mut(*key) {
+            strip_unsupported_patterns(value);
+        }
+    }
+
+    for key in SUBSCHEMA_MAP_KEYS {
+        if let Some(Value::Object(entries)) = map.get_mut(*key) {
+            for value in entries.values_mut() {
+                strip_unsupported_patterns(value);
+            }
+        }
+    }
+
+    for key in SUBSCHEMA_LIST_KEYS {
+        if let Some(Value::Array(entries)) = map.get_mut(*key) {
+            for value in entries {
+                strip_unsupported_patterns(value);
+            }
+        }
+    }
+}
+
+fn uses_unicode_property_escape(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            i += 1;
+            continue;
+        }
+        // A backslash consumes the byte after it, so `\\p{L}` is a literal
+        // backslash followed by `p` rather than a property escape.
+        match bytes.get(i + 1) {
+            Some(b'p') | Some(b'P') => return true,
+            _ => i += 2,
+        }
+    }
+    false
 }
 
 fn codex_tool_description(name: &str, description: Option<String>) -> Option<String> {
@@ -1547,6 +1662,299 @@ mod tests {
                 .and_then(Value::as_str),
             Some("record offset")
         );
+    }
+
+    #[test]
+    fn translate_drops_tool_patterns_with_unicode_property_escapes() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [{"role":"user", "content":"publish it"}],
+            "tools": [{
+                "name": "Artifact",
+                "description": "Render an HTML file to an Artifact.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "field": {
+                            "type": "string",
+                            "pattern": "^(?!__.*__$)[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}\"\\\\./[\\]]{1,200}$"
+                        },
+                        "asset_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+                        "doc_id": {
+                            "type": "string",
+                            "pattern": "^(?!\\.\\.?(?:\\/|$))[A-Za-z0-9_\\-.~:@+]{1,200}$"
+                        },
+                        "writes": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "collection": {"type": "string", "pattern": "^\\P{Cc}{1,200}$"}
+                                }
+                            }
+                        }
+                    }
+                }
+            }]
+        }))
+        .unwrap();
+        let out = translate_request(&req, opts()).unwrap();
+        let tools = out.tools.as_ref().unwrap();
+        let ResponsesTool::Function(tool) = &tools[0] else {
+            panic!("expected function tool");
+        };
+        let props = tool
+            .parameters
+            .get("properties")
+            .and_then(Value::as_object)
+            .unwrap();
+
+        // Unsupported patterns are dropped, but the property they constrained stays.
+        assert!(props.get("field").and_then(|v| v.get("pattern")).is_none());
+        assert_eq!(
+            props
+                .get("field")
+                .and_then(|v| v.get("type"))
+                .and_then(Value::as_str),
+            Some("string")
+        );
+        assert!(
+            props
+                .get("writes")
+                .and_then(|v| v.get("items"))
+                .and_then(|v| v.get("properties"))
+                .and_then(|v| v.get("collection"))
+                .and_then(|v| v.get("pattern"))
+                .is_none()
+        );
+
+        // Patterns the Responses API accepts are left alone, lookaheads included.
+        assert_eq!(
+            props
+                .get("asset_id")
+                .and_then(|v| v.get("pattern"))
+                .and_then(Value::as_str),
+            Some("^[0-9a-f]{32}$")
+        );
+        assert_eq!(
+            props
+                .get("doc_id")
+                .and_then(|v| v.get("pattern"))
+                .and_then(Value::as_str),
+            Some("^(?!\\.\\.?(?:\\/|$))[A-Za-z0-9_\\-.~:@+]{1,200}$")
+        );
+    }
+
+    #[test]
+    fn translate_keeps_instance_data_that_looks_like_a_schema() {
+        // `enum` / `const` / `default` / `examples` hold values the tool accepts,
+        // so a `pattern` key inside them is data and must survive untouched.
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [{"role":"user", "content":"hi"}],
+            "tools": [{
+                "name": "Rule",
+                "description": "Store a matcher.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "preset": {
+                            "enum": [{"pattern": "\\p{L}"}, {"pattern": "^[a-z]$"}],
+                            "default": {"pattern": "\\p{L}"},
+                            "examples": [{"pattern": "\\P{Nd}"}]
+                        },
+                        "fixed": {"const": {"pattern": "\\p{Cc}"}}
+                    }
+                }
+            }]
+        }))
+        .unwrap();
+        let out = translate_request(&req, opts()).unwrap();
+        let tools = out.tools.as_ref().unwrap();
+        let ResponsesTool::Function(tool) = &tools[0] else {
+            panic!("expected function tool");
+        };
+        let preset = tool
+            .parameters
+            .get("properties")
+            .and_then(|v| v.get("preset"))
+            .unwrap();
+
+        assert_eq!(
+            preset.get("enum").unwrap(),
+            &json!([{"pattern": "\\p{L}"}, {"pattern": "^[a-z]$"}])
+        );
+        assert_eq!(
+            preset.get("default").unwrap(),
+            &json!({"pattern": "\\p{L}"})
+        );
+        assert_eq!(
+            preset.get("examples").unwrap(),
+            &json!([{"pattern": "\\P{Nd}"}])
+        );
+        assert_eq!(
+            tool.parameters
+                .get("properties")
+                .and_then(|v| v.get("fixed"))
+                .and_then(|v| v.get("const"))
+                .unwrap(),
+            &json!({"pattern": "\\p{Cc}"})
+        );
+    }
+
+    #[test]
+    fn translate_strips_patterns_in_every_subschema_position() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [{"role":"user", "content":"hi"}],
+            "tools": [{
+                "name": "Nested",
+                "description": "Exercise subschema keywords.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "one_of": {"oneOf": [{"type": "string", "pattern": "^\\p{L}$"}]},
+                        "any_of": {"anyOf": [{"type": "string", "pattern": "^\\p{L}$"}]},
+                        "all_of": {"allOf": [{"type": "string", "pattern": "^\\p{L}$"}]},
+                        "tuple": {"prefixItems": [{"type": "string", "pattern": "^\\p{L}$"}]},
+                        "draft7_tuple": {"items": [{"type": "string", "pattern": "^\\p{L}$"}]},
+                        "free_form": {"additionalProperties": {"type": "string", "pattern": "^\\p{L}$"}},
+                        "keys": {"propertyNames": {"pattern": "^\\p{L}$"}},
+                        "embedded": {
+                            "type": "string",
+                            "contentMediaType": "application/json",
+                            "contentSchema": {"properties": {"inner": {"pattern": "^\\p{L}$"}}}
+                        },
+                        "deps": {
+                            "dependencies": {
+                                "schema_dep": {"properties": {"bar": {"pattern": "^\\p{L}$"}}},
+                                "property_dep": ["a", "b"]
+                            }
+                        },
+                        "guarded": {
+                            "if": {"pattern": "^\\p{L}$"},
+                            "then": {"pattern": "^\\p{L}$"},
+                            "else": {"pattern": "^\\p{L}$"},
+                            "not": {"pattern": "^\\p{L}$"}
+                        }
+                    },
+                    "$defs": {"named": {"type": "string", "pattern": "^\\p{L}$"}}
+                }
+            }]
+        }))
+        .unwrap();
+        let out = translate_request(&req, opts()).unwrap();
+        let tools = out.tools.as_ref().unwrap();
+        let ResponsesTool::Function(tool) = &tools[0] else {
+            panic!("expected function tool");
+        };
+        let rendered = serde_json::to_string(&tool.parameters).unwrap();
+        assert!(
+            !rendered.contains("p{L}"),
+            "unsupported pattern survived: {rendered}"
+        );
+        // The schema itself is otherwise intact.
+        assert!(rendered.contains("propertyNames"));
+        assert!(rendered.contains("$defs"));
+        // Draft-07 property dependencies are arrays of names, not schemas.
+        assert_eq!(
+            tool.parameters
+                .get("properties")
+                .and_then(|v| v.get("deps"))
+                .and_then(|v| v.get("dependencies"))
+                .and_then(|v| v.get("property_dep"))
+                .unwrap(),
+            &json!(["a", "b"])
+        );
+    }
+
+    #[test]
+    fn translate_forwards_pattern_properties_keys_unchanged() {
+        // The keys are regexes the upstream may reject, but no repair preserves
+        // the schema's meaning, so they are passed through. Their subschemas are
+        // still sanitized.
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [{"role":"user", "content":"hi"}],
+            "tools": [{
+                "name": "Keyed",
+                "description": "Pattern-keyed object.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "bag": {
+                            "type": "object",
+                            "patternProperties": {
+                                "^\\p{L}+$": {"type": "string", "pattern": "^\\p{Nd}$"},
+                                "^[a-z]+$": {"type": "string"}
+                            }
+                        }
+                    }
+                }
+            }]
+        }))
+        .unwrap();
+        let out = translate_request(&req, opts()).unwrap();
+        let tools = out.tools.as_ref().unwrap();
+        let ResponsesTool::Function(tool) = &tools[0] else {
+            panic!("expected function tool");
+        };
+        let entries = tool
+            .parameters
+            .get("properties")
+            .and_then(|v| v.get("bag"))
+            .and_then(|v| v.get("patternProperties"))
+            .and_then(Value::as_object)
+            .unwrap();
+
+        assert_eq!(entries.len(), 2);
+        let unsupported_key = entries.get("^\\p{L}+$").unwrap();
+        assert_eq!(
+            unsupported_key.get("type").and_then(Value::as_str),
+            Some("string")
+        );
+        assert!(unsupported_key.get("pattern").is_none());
+        assert!(entries.contains_key("^[a-z]+$"));
+    }
+
+    #[test]
+    fn translate_leaves_non_schema_tool_parameters_alone() {
+        // A bare `additionalProperties: false` must not be mistaken for a schema.
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [{"role":"user", "content":"hi"}],
+            "tools": [{
+                "name": "Strict",
+                "description": "Closed object.",
+                "input_schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {"a": {"type": "string"}}
+                }
+            }]
+        }))
+        .unwrap();
+        let out = translate_request(&req, opts()).unwrap();
+        let tools = out.tools.as_ref().unwrap();
+        let ResponsesTool::Function(tool) = &tools[0] else {
+            panic!("expected function tool");
+        };
+        assert_eq!(
+            tool.parameters.get("additionalProperties").unwrap(),
+            &Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn unicode_property_escape_detection_ignores_literal_backslash() {
+        assert!(uses_unicode_property_escape("^\\p{L}+$"));
+        assert!(uses_unicode_property_escape("^\\P{Cc}$"));
+        assert!(uses_unicode_property_escape("^[^\\p{Cc}]{1,10}$"));
+        assert!(!uses_unicode_property_escape("^[a-z]{1,10}$"));
+        assert!(!uses_unicode_property_escape("^(?!__).{1,10}$"));
+        // A literal backslash followed by `p` is not a property escape.
+        assert!(!uses_unicode_property_escape("^\\\\p{L}$"));
+        assert!(!uses_unicode_property_escape("trailing\\\\"));
     }
 
     #[test]
