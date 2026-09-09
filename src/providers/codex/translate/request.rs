@@ -559,10 +559,13 @@ const SUBSCHEMA_KEYS: &[&str] = &[
     "unevaluatedProperties",
 ];
 
-/// JSON Schema keywords whose value maps names to subschemas.
+/// JSON Schema keywords whose value maps names to subschemas. Draft-07's
+/// `dependencies` also maps names to arrays of property names; those are not
+/// objects, so they are skipped without a special case.
 const SUBSCHEMA_MAP_KEYS: &[&str] = &[
     "$defs",
     "definitions",
+    "dependencies",
     "dependentSchemas",
     "patternProperties",
     "properties",
@@ -1465,6 +1468,12 @@ mod tests {
                         "draft7_tuple": {"items": [{"type": "string", "pattern": "^\\p{L}$"}]},
                         "free_form": {"additionalProperties": {"type": "string", "pattern": "^\\p{L}$"}},
                         "keys": {"propertyNames": {"pattern": "^\\p{L}$"}},
+                        "deps": {
+                            "dependencies": {
+                                "schema_dep": {"properties": {"bar": {"pattern": "^\\p{L}$"}}},
+                                "property_dep": ["a", "b"]
+                            }
+                        },
                         "guarded": {
                             "if": {"pattern": "^\\p{L}$"},
                             "then": {"pattern": "^\\p{L}$"},
@@ -1490,6 +1499,16 @@ mod tests {
         // The schema itself is otherwise intact.
         assert!(rendered.contains("propertyNames"));
         assert!(rendered.contains("$defs"));
+        // Draft-07 property dependencies are arrays of names, not schemas.
+        assert_eq!(
+            tool.parameters
+                .get("properties")
+                .and_then(|v| v.get("deps"))
+                .and_then(|v| v.get("dependencies"))
+                .and_then(|v| v.get("property_dep"))
+                .unwrap(),
+            &json!(["a", "b"])
+        );
     }
 
     #[test]
