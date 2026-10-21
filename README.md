@@ -9,9 +9,16 @@ LLM docs: <https://claude-code-proxy.raine.dev/llms.txt>
 
 <img src="meta/claude-code-screenshot-2026-07.webp" alt="Claude Code running through claude-code-proxy" />
 
-> [!TIP]
-> I'm building [aven](https://github.com/raine/aven), a local-first task manager
-> for power users and agents.
+<a href="https://aventasks.dev/">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://aventasks.dev/readme/aven-banner-dark.webp">
+    <img src="https://aventasks.dev/readme/aven-banner-light.webp" alt="aven: one task queue for you and your coding agents" width="100%">
+  </picture>
+</a>
+
+<sub>Also from the author of claude-code-proxy: <a href="https://aventasks.dev/"><b>aven</b></a>, one
+queue for every project, with a keyboard-driven TUI for you and a CLI for your
+agents.</sub>
 
 ## Why?
 
@@ -54,13 +61,17 @@ Start the proxy in one terminal:
 claude-code-proxy serve
 ```
 
+For a background service, use `claude-code-proxy serve --no-monitor` and attach
+from another terminal with `claude-code-proxy monitor`. Closing an attached
+dashboard leaves the proxy running.
+
 Start Claude Code in another:
 
 ```sh
 ANTHROPIC_BASE_URL=http://127.0.0.1:18765 \
 ANTHROPIC_AUTH_TOKEN=unused \
-ANTHROPIC_MODEL=gpt-5.6-sol[1m] \
-ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna[1m] \
+ANTHROPIC_MODEL=gpt-6-sol[1m] \
+ANTHROPIC_SMALL_FAST_MODEL=gpt-6-luna[1m] \
 CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 \
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
@@ -85,7 +96,7 @@ The opt-in Images API returns base64 image data and consumes the signed-in accou
 
 | Provider     | Account                        | Model selection                                 |
 | ------------ | ------------------------------ | ----------------------------------------------- |
-| Codex        | ChatGPT Plus or Pro            | Registered `gpt-*` models and `-fast` variants  |
+| Codex        | ChatGPT Plus or Pro            | Registered `gpt-*` models, `-fast`/`-ultrafast` |
 | Kimi         | kimi.com with Kimi Code access | `kimi-for-coding` and aliases                   |
 | Grok         | grok.com                       | Registered Grok models                          |
 | OpenCode Go  | OpenCode Go subscription       | Non-conflicting IDs and `opencode-go/<model-id>` |

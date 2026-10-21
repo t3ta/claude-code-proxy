@@ -11,6 +11,7 @@ use crate::providers::translate_shared::{
     read_effort,
 };
 
+use super::model_allowlist::service_tier_for_model;
 use super::read_rewrite::{ReadOffsetRewrite, read_offset_rewrite};
 use super::reasoning_signature::decode_reasoning_signature;
 
@@ -46,6 +47,7 @@ impl std::fmt::Display for Effort {
 #[serde(rename_all = "snake_case")]
 pub enum ServiceTier {
     Priority,
+    Ultrafast,
     Flex,
 }
 
@@ -308,6 +310,14 @@ fn reasoning_summary_requested(summary: Option<&str>) -> bool {
     !matches!(summary, Some("off" | "none"))
 }
 
+/// Whether the resolved effort asks the upstream for reasoning output.
+/// `Effort::None` still names the effort so the wire request overrides the
+/// upstream default, but it must not request a summary or encrypted
+/// continuation content, which are reasoning artifacts.
+fn reasoning_requested(effort: Option<&Effort>) -> bool {
+    effort.is_some_and(|effort| *effort != Effort::None)
+}
+
 // ---------------------------------------------------------------------------
 // Compaction fast path
 // ---------------------------------------------------------------------------
@@ -352,8 +362,22 @@ pub(crate) fn is_compact_messages_request(request: &MessagesRequest) -> bool {
 /// native Claude Code compacts without extended thinking, so burning
 /// medium/high reasoning on a 200k-token summary only adds latency. The cap
 /// never raises effort — a request already below it is left alone.
+///
+/// A request naming no effort at all also takes the cap. Left unset it would
+/// run at the upstream default, which is the effort level the cap exists to
+/// avoid.
 fn compact_effort_cap() -> Option<Effort> {
     compact_effort_cap_from(std::env::var("CCP_COMPACT_EFFORT").ok().as_deref())
+}
+
+/// Applies the cap to a request's resolved effort. A missing effort takes
+/// the cap; an explicit effort at or below it is preserved.
+fn apply_compact_effort_cap(resolved: Option<Effort>, cap: Option<Effort>) -> Option<Effort> {
+    match (resolved, cap) {
+        (resolved, None) => resolved,
+        (Some(effort), Some(cap)) if effort <= cap => Some(effort),
+        (_, Some(cap)) => Some(cap),
+    }
 }
 
 fn compact_effort_cap_from(raw: Option<&str>) -> Option<Effort> {
@@ -365,29 +389,39 @@ fn compact_effort_cap_from(raw: Option<&str>) -> Option<Effort> {
     }
 }
 
-const VALID_SERVICE_TIERS: &[&str] = &["fast", "priority", "flex"];
+const VALID_SERVICE_TIERS: &[&str] = &["fast", "priority", "ultrafast", "flex"];
 
 fn normalize_service_tier(tier: &str) -> Result<ServiceTier, anyhow::Error> {
-    if !VALID_SERVICE_TIERS.contains(&tier) {
-        anyhow::bail!(
+    match tier {
+        "fast" | "priority" => Ok(ServiceTier::Priority),
+        "ultrafast" => Ok(ServiceTier::Ultrafast),
+        "flex" => Ok(ServiceTier::Flex),
+        _ => anyhow::bail!(
             "Invalid service tier override: \"{tier}\". Must be one of: {}",
             VALID_SERVICE_TIERS.join(", ")
-        );
-    }
-    match tier {
-        "flex" => Ok(ServiceTier::Flex),
-        _ => Ok(ServiceTier::Priority),
+        ),
     }
 }
 
 fn resolve_service_tier(
     model_tier: Option<ServiceTier>,
+    model: &str,
 ) -> Result<Option<ServiceTier>, anyhow::Error> {
-    let tier = config::codex_service_tier();
-    match tier {
-        Some(ref val) => Ok(Some(normalize_service_tier(val)?)),
-        None => Ok(model_tier),
-    }
+    pick_service_tier(config::codex_service_tier().as_deref(), model_tier, model)
+}
+
+/// The configured override wins over the tier implied by the model name. Either
+/// one is narrowed to a tier the upstream `model` offers.
+fn pick_service_tier(
+    override_tier: Option<&str>,
+    model_tier: Option<ServiceTier>,
+    model: &str,
+) -> Result<Option<ServiceTier>, anyhow::Error> {
+    let tier = match override_tier {
+        Some(value) => Some(normalize_service_tier(value)?),
+        None => model_tier,
+    };
+    Ok(tier.map(|tier| service_tier_for_model(model, tier)))
 }
 
 pub fn normalize_strict_json_schema(schema: &Value) -> Value {
@@ -546,7 +580,7 @@ fn translate_request_inner(
     }
 
     if apply_codex_config {
-        let service_tier = resolve_service_tier(opts.service_tier)?;
+        let service_tier = resolve_service_tier(opts.service_tier, &out.model)?;
         if let Some(ref tier) = service_tier {
             out.service_tier = Some(tier.clone());
         }
@@ -559,15 +593,12 @@ fn translate_request_inner(
     } else {
         codex_effort
     };
-    if apply_codex_config
-        && is_compact
-        && let Some(cap) = compact_effort_cap()
-        && resolved_effort.as_ref().is_some_and(|e| *e > cap)
-    {
-        resolved_effort = Some(cap);
+    if apply_codex_config && is_compact {
+        resolved_effort = apply_compact_effort_cap(resolved_effort, compact_effort_cap());
     }
+    let wants_reasoning = reasoning_requested(resolved_effort.as_ref());
     if resolved_effort.is_some() || opts.use_responses_lite {
-        let summary = if resolved_effort.is_some()
+        let summary = if wants_reasoning
             && (!apply_codex_config
                 || reasoning_summary_requested(config::codex_reasoning_summary().as_deref()))
         {
@@ -581,7 +612,7 @@ fn translate_request_inner(
             context: opts.use_responses_lite.then_some("all_turns".to_string()),
         });
     }
-    if resolved_effort.is_some() {
+    if wants_reasoning {
         out.include = Some(vec!["reasoning.encrypted_content".to_string()]);
     }
 
@@ -674,8 +705,7 @@ fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyho
                 .cloned()
                 .unwrap_or(serde_json::json!({}));
             let description = codex_tool_description(&name, description);
-            let mut parameters = codex_tool_parameters(&name, parameters);
-            strip_unsupported_patterns(&mut parameters);
+            let parameters = codex_tool_parameters(&name, parameters);
             out.push(ResponsesTool::Function(ResponsesFunctionTool {
                 kind: "function".to_string(),
                 name,
@@ -692,120 +722,6 @@ fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyho
     }
 }
 
-/// JSON Schema keywords whose value is a single subschema.
-const SUBSCHEMA_KEYS: &[&str] = &[
-    "additionalItems",
-    "additionalProperties",
-    "contains",
-    "contentSchema",
-    "else",
-    "if",
-    "not",
-    "propertyNames",
-    "then",
-    "unevaluatedItems",
-    "unevaluatedProperties",
-];
-
-/// JSON Schema keywords whose value maps names to subschemas. Draft-07's
-/// `dependencies` also maps names to arrays of property names; those are not
-/// objects, so they are skipped without a special case.
-const SUBSCHEMA_MAP_KEYS: &[&str] = &[
-    "$defs",
-    "definitions",
-    "dependencies",
-    "dependentSchemas",
-    "patternProperties",
-    "properties",
-];
-
-/// JSON Schema keywords whose value is a list of subschemas.
-const SUBSCHEMA_LIST_KEYS: &[&str] = &["allOf", "anyOf", "oneOf", "prefixItems"];
-
-/// The Responses API validates tool schemas and rejects any `pattern` that uses
-/// Unicode property escapes (`\p{...}` / `\P{...}`) with
-/// `Invalid schema for function '<name>': ... is not a 'regex'`, which fails the
-/// whole request. A `pattern` only constrains arguments the model produces, so
-/// dropping the unsupported ones keeps the tool usable instead of losing the turn.
-///
-/// Only keywords whose values are subschemas are traversed. `enum`, `const`,
-/// `default` and `examples` hold instance data, where a `pattern` key is an
-/// allowed argument value rather than a constraint, so rewriting it would change
-/// what the tool accepts.
-///
-/// `patternProperties` keys are regular expressions too, and an unsupported one
-/// is rejected the same way. They are still forwarded unchanged, because neither
-/// repair preserves the schema's meaning: dropping the entry can leave a closed
-/// object that rejects every key it used to allow, and re-keying it to a
-/// universal matcher can stack its subschema onto keys a sibling entry already
-/// constrains, making them unsatisfiable. Failing the request is the honest
-/// outcome; a silently misshapen schema is not.
-fn strip_unsupported_patterns(schema: &mut Value) {
-    let Some(map) = schema.as_object_mut() else {
-        return;
-    };
-
-    if map
-        .get("pattern")
-        .and_then(Value::as_str)
-        .is_some_and(uses_unicode_property_escape)
-    {
-        map.remove("pattern");
-    }
-
-    // `items` holds a single schema in 2020-12 and a tuple of schemas in draft-07.
-    if let Some(items) = map.get_mut("items") {
-        match items {
-            Value::Array(entries) => {
-                for entry in entries {
-                    strip_unsupported_patterns(entry);
-                }
-            }
-            other => strip_unsupported_patterns(other),
-        }
-    }
-
-    for key in SUBSCHEMA_KEYS {
-        if let Some(value) = map.get_mut(*key) {
-            strip_unsupported_patterns(value);
-        }
-    }
-
-    for key in SUBSCHEMA_MAP_KEYS {
-        if let Some(Value::Object(entries)) = map.get_mut(*key) {
-            for value in entries.values_mut() {
-                strip_unsupported_patterns(value);
-            }
-        }
-    }
-
-    for key in SUBSCHEMA_LIST_KEYS {
-        if let Some(Value::Array(entries)) = map.get_mut(*key) {
-            for value in entries {
-                strip_unsupported_patterns(value);
-            }
-        }
-    }
-}
-
-fn uses_unicode_property_escape(pattern: &str) -> bool {
-    let bytes = pattern.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'\\' {
-            i += 1;
-            continue;
-        }
-        // A backslash consumes the byte after it, so `\\p{L}` is a literal
-        // backslash followed by `p` rather than a property escape.
-        match bytes.get(i + 1) {
-            Some(b'p') | Some(b'P') => return true,
-            _ => i += 2,
-        }
-    }
-    false
-}
-
 fn codex_tool_description(name: &str, description: Option<String>) -> Option<String> {
     if name != "Read" {
         return description;
@@ -815,7 +731,54 @@ fn codex_tool_description(name: &str, description: Option<String>) -> Option<Str
     Some(format!("{base}\n\n{}", read_offset_guidance()))
 }
 
+// OpenAI's regex dialect differs from schemas emitted by clients. Drop pattern
+// constraints rather than guessing backend compatibility with a local regex engine.
+// This relaxes tool argument validation, including otherwise compatible patterns.
+// Only visit schema-bearing keywords: defaults, examples and other literal data
+// must remain intact, as must names in property and definition maps.
+fn strip_tool_schema_patterns(schema: &mut Value) {
+    let Some(schema) = schema.as_object_mut() else {
+        return;
+    };
+    schema.remove("pattern");
+
+    for (keyword, value) in schema {
+        match keyword.as_str() {
+            "properties" | "patternProperties" | "$defs" | "definitions" | "dependentSchemas"
+            | "dependencies" => {
+                if let Some(schemas) = value.as_object_mut() {
+                    for schema in schemas.values_mut() {
+                        strip_tool_schema_patterns(schema);
+                    }
+                }
+            }
+            "allOf" | "anyOf" | "oneOf" | "prefixItems" | "items" => {
+                if let Some(schemas) = value.as_array_mut() {
+                    for schema in schemas {
+                        strip_tool_schema_patterns(schema);
+                    }
+                } else if keyword == "items" {
+                    strip_tool_schema_patterns(value);
+                }
+            }
+            "additionalProperties"
+            | "additionalItems"
+            | "unevaluatedProperties"
+            | "unevaluatedItems"
+            | "contains"
+            | "propertyNames"
+            | "not"
+            | "if"
+            | "then"
+            | "else"
+            | "contentSchema" => strip_tool_schema_patterns(value),
+            _ => {}
+        }
+    }
+}
+
 fn codex_tool_parameters(name: &str, mut parameters: Value) -> Value {
+    strip_tool_schema_patterns(&mut parameters);
     if name != "Read" {
         return parameters;
     }
@@ -1262,6 +1225,78 @@ mod tests {
     }
 
     #[test]
+    fn service_tier_override_values_normalize_to_wire_tiers() {
+        for (value, tier, wire) in [
+            ("fast", ServiceTier::Priority, "priority"),
+            ("priority", ServiceTier::Priority, "priority"),
+            ("ultrafast", ServiceTier::Ultrafast, "ultrafast"),
+            ("flex", ServiceTier::Flex, "flex"),
+        ] {
+            let normalized = normalize_service_tier(value).unwrap();
+            assert_eq!(normalized, tier, "{value}");
+            assert_eq!(serde_json::to_value(normalized).unwrap(), json!(wire));
+        }
+        for value in ["", "default", "Ultrafast", "ultra-fast", "turbo"] {
+            let error = normalize_service_tier(value).unwrap_err().to_string();
+            assert!(error.contains("ultrafast"), "{value}: {error}");
+        }
+    }
+
+    #[test]
+    fn service_tier_override_wins_and_narrows_to_the_model() {
+        let cases = [
+            (None, None, "gpt-6-astra", None),
+            (
+                None,
+                Some(ServiceTier::Ultrafast),
+                "gpt-6-astra",
+                Some(ServiceTier::Ultrafast),
+            ),
+            (
+                None,
+                Some(ServiceTier::Ultrafast),
+                "gpt-6-sol",
+                Some(ServiceTier::Priority),
+            ),
+            (
+                Some("ultrafast"),
+                None,
+                "gpt-6-astra",
+                Some(ServiceTier::Ultrafast),
+            ),
+            (
+                Some("ultrafast"),
+                Some(ServiceTier::Priority),
+                "gpt-6-astra",
+                Some(ServiceTier::Ultrafast),
+            ),
+            (
+                Some("ultrafast"),
+                None,
+                "gpt-6-luna",
+                Some(ServiceTier::Priority),
+            ),
+            (
+                Some("fast"),
+                Some(ServiceTier::Ultrafast),
+                "gpt-6-astra",
+                Some(ServiceTier::Priority),
+            ),
+            (
+                Some("flex"),
+                Some(ServiceTier::Ultrafast),
+                "gpt-6-astra",
+                Some(ServiceTier::Flex),
+            ),
+        ];
+        for (override_tier, model_tier, model, expected) in cases {
+            let picked = pick_service_tier(override_tier, model_tier.clone(), model).unwrap();
+            assert_eq!(picked, expected, "{override_tier:?} {model_tier:?} {model}");
+        }
+        assert!(pick_service_tier(Some("turbo"), None, "gpt-6-astra").is_err());
+    }
+
+    #[test]
     fn responses_tool_choice_modes_serialize_as_openai_strings() {
         for (mode, expected) in [
             (ResponsesToolChoiceMode::Auto, json!("auto")),
@@ -1572,6 +1607,153 @@ mod tests {
     }
 
     #[test]
+    fn translate_artifact_tool_strips_exact_incompatible_pattern() {
+        let req: MessagesRequest = serde_json::from_str(
+            r#"{
+                "model": "gpt-5.5",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{
+                    "name": "Artifact",
+                    "description": "Manage artifacts.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "field": {
+                                "type": "string",
+                                "pattern": "^(?!__.*__$)[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}\"\\\\./[\\]]{1,200}$",
+                                "minLength": 1,
+                                "maxLength": 200
+                            }
+                        },
+                        "required": ["field"],
+                        "additionalProperties": false
+                    }
+                }]
+            }"#,
+        )
+        .unwrap();
+        let original_tools = req.extra["tools"].clone();
+        assert_eq!(
+            original_tools[0]["input_schema"]["properties"]["field"]["pattern"],
+            r#"^(?!__.*__$)[^\p{Cc}\p{Cf}\p{Zl}\p{Zp}"\\./[\]]{1,200}$"#
+        );
+        let mut expected = original_tools[0]["input_schema"].clone();
+        expected["properties"]["field"]
+            .as_object_mut()
+            .unwrap()
+            .remove("pattern");
+
+        let normal = translate_request(&req, opts()).unwrap();
+        let compatible =
+            translate_openai_compatible_request(&req, "gpt-5.5".to_string(), None).unwrap();
+        let lite = translate_request(
+            &req,
+            TranslateOptions {
+                use_responses_lite: true,
+                ..opts()
+            },
+        )
+        .unwrap();
+        for out in [normal, compatible, lite] {
+            let wire = serde_json::to_value(out).unwrap();
+            let tool = if wire["tools"].is_array() {
+                &wire["tools"][0]
+            } else {
+                &wire["input"][0]["tools"][0]
+            };
+            assert_eq!(
+                tool,
+                &json!({
+                    "type": "function",
+                    "name": "Artifact",
+                    "description": "Manage artifacts.",
+                    "parameters": expected,
+                    "strict": false
+                })
+            );
+        }
+        assert_eq!(req.extra["tools"], original_tools);
+    }
+
+    #[test]
+    fn tool_schema_patterns_are_removed_only_from_schema_locations() {
+        let literal = json!({
+            "pattern": "literal pattern",
+            "properties": {"pattern": {"pattern": "also literal"}},
+            "items": [{"pattern": "literal item"}]
+        });
+        let leaf = json!({
+            "type": "string",
+            "pattern": "^[a-z]+$",
+            "description": "Keep metadata and literal data.",
+            "default": literal,
+            "examples": [literal],
+            "const": literal,
+            "enum": [literal],
+            "x-custom": literal
+        });
+        let mut clean_leaf = leaf.clone();
+        clean_leaf.as_object_mut().unwrap().remove("pattern");
+
+        let mut schema = json!({"pattern": "^root$", "required": ["pattern"]});
+        let mut expected = json!({"required": ["pattern"]});
+        for keyword in [
+            "properties",
+            "patternProperties",
+            "$defs",
+            "definitions",
+            "dependentSchemas",
+            "dependencies",
+        ] {
+            schema[keyword] = json!({
+                "pattern": leaf,
+                "properties": {"properties": {"pattern": leaf}},
+                "booleanSchema": false
+            });
+            expected[keyword] = json!({
+                "pattern": clean_leaf,
+                "properties": {"properties": {"pattern": clean_leaf}},
+                "booleanSchema": false
+            });
+        }
+        for keyword in ["allOf", "anyOf", "oneOf", "prefixItems", "items"] {
+            schema[keyword] = json!([leaf, true, false]);
+            expected[keyword] = json!([clean_leaf, true, false]);
+        }
+        for keyword in [
+            "additionalProperties",
+            "additionalItems",
+            "unevaluatedProperties",
+            "unevaluatedItems",
+            "contains",
+            "propertyNames",
+            "not",
+            "if",
+            "then",
+            "else",
+            "contentSchema",
+        ] {
+            schema[keyword] = leaf.clone();
+            expected[keyword] = clean_leaf.clone();
+        }
+        schema["dependencies"]["literalDependency"] = json!(["pattern"]);
+        expected["dependencies"]["literalDependency"] = json!(["pattern"]);
+        schema["$ref"] = json!("#/$defs/pattern");
+        expected["$ref"] = json!("#/$defs/pattern");
+        assert_eq!(codex_tool_parameters("Custom", schema), expected);
+
+        let nested = json!({"items": {"properties": {"pattern": leaf}}});
+        let expected = json!({"items": {"properties": {"pattern": clean_leaf}}});
+        assert_eq!(codex_tool_parameters("Custom", nested), expected);
+        for unchanged in [json!({}), json!(true), json!(false)] {
+            assert_eq!(
+                codex_tool_parameters("Custom", unchanged.clone()),
+                unchanged
+            );
+        }
+    }
+
+    #[test]
     fn translate_read_tool_adds_codex_offset_guidance() {
         let req: MessagesRequest = serde_json::from_value(json!({
             "model": "gpt-5.5",
@@ -1582,7 +1764,7 @@ mod tests {
                 "input_schema": {
                     "type": "object",
                     "properties": {
-                        "file_path": {"type": "string"},
+                        "file_path": {"type": "string", "pattern": "^/"},
                         "offset": {"type": "integer", "description": "old offset"},
                         "limit": {"type": "integer", "description": "old limit"}
                     },
@@ -1606,6 +1788,7 @@ mod tests {
             .get("properties")
             .and_then(Value::as_object)
             .unwrap();
+        assert_eq!(props["file_path"], json!({"type": "string"}));
         assert_eq!(
             props
                 .get("offset")
@@ -1662,299 +1845,6 @@ mod tests {
                 .and_then(Value::as_str),
             Some("record offset")
         );
-    }
-
-    #[test]
-    fn translate_drops_tool_patterns_with_unicode_property_escapes() {
-        let req: MessagesRequest = serde_json::from_value(json!({
-            "model": "gpt-5.5",
-            "messages": [{"role":"user", "content":"publish it"}],
-            "tools": [{
-                "name": "Artifact",
-                "description": "Render an HTML file to an Artifact.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "field": {
-                            "type": "string",
-                            "pattern": "^(?!__.*__$)[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}\"\\\\./[\\]]{1,200}$"
-                        },
-                        "asset_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
-                        "doc_id": {
-                            "type": "string",
-                            "pattern": "^(?!\\.\\.?(?:\\/|$))[A-Za-z0-9_\\-.~:@+]{1,200}$"
-                        },
-                        "writes": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "collection": {"type": "string", "pattern": "^\\P{Cc}{1,200}$"}
-                                }
-                            }
-                        }
-                    }
-                }
-            }]
-        }))
-        .unwrap();
-        let out = translate_request(&req, opts()).unwrap();
-        let tools = out.tools.as_ref().unwrap();
-        let ResponsesTool::Function(tool) = &tools[0] else {
-            panic!("expected function tool");
-        };
-        let props = tool
-            .parameters
-            .get("properties")
-            .and_then(Value::as_object)
-            .unwrap();
-
-        // Unsupported patterns are dropped, but the property they constrained stays.
-        assert!(props.get("field").and_then(|v| v.get("pattern")).is_none());
-        assert_eq!(
-            props
-                .get("field")
-                .and_then(|v| v.get("type"))
-                .and_then(Value::as_str),
-            Some("string")
-        );
-        assert!(
-            props
-                .get("writes")
-                .and_then(|v| v.get("items"))
-                .and_then(|v| v.get("properties"))
-                .and_then(|v| v.get("collection"))
-                .and_then(|v| v.get("pattern"))
-                .is_none()
-        );
-
-        // Patterns the Responses API accepts are left alone, lookaheads included.
-        assert_eq!(
-            props
-                .get("asset_id")
-                .and_then(|v| v.get("pattern"))
-                .and_then(Value::as_str),
-            Some("^[0-9a-f]{32}$")
-        );
-        assert_eq!(
-            props
-                .get("doc_id")
-                .and_then(|v| v.get("pattern"))
-                .and_then(Value::as_str),
-            Some("^(?!\\.\\.?(?:\\/|$))[A-Za-z0-9_\\-.~:@+]{1,200}$")
-        );
-    }
-
-    #[test]
-    fn translate_keeps_instance_data_that_looks_like_a_schema() {
-        // `enum` / `const` / `default` / `examples` hold values the tool accepts,
-        // so a `pattern` key inside them is data and must survive untouched.
-        let req: MessagesRequest = serde_json::from_value(json!({
-            "model": "gpt-5.5",
-            "messages": [{"role":"user", "content":"hi"}],
-            "tools": [{
-                "name": "Rule",
-                "description": "Store a matcher.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "preset": {
-                            "enum": [{"pattern": "\\p{L}"}, {"pattern": "^[a-z]$"}],
-                            "default": {"pattern": "\\p{L}"},
-                            "examples": [{"pattern": "\\P{Nd}"}]
-                        },
-                        "fixed": {"const": {"pattern": "\\p{Cc}"}}
-                    }
-                }
-            }]
-        }))
-        .unwrap();
-        let out = translate_request(&req, opts()).unwrap();
-        let tools = out.tools.as_ref().unwrap();
-        let ResponsesTool::Function(tool) = &tools[0] else {
-            panic!("expected function tool");
-        };
-        let preset = tool
-            .parameters
-            .get("properties")
-            .and_then(|v| v.get("preset"))
-            .unwrap();
-
-        assert_eq!(
-            preset.get("enum").unwrap(),
-            &json!([{"pattern": "\\p{L}"}, {"pattern": "^[a-z]$"}])
-        );
-        assert_eq!(
-            preset.get("default").unwrap(),
-            &json!({"pattern": "\\p{L}"})
-        );
-        assert_eq!(
-            preset.get("examples").unwrap(),
-            &json!([{"pattern": "\\P{Nd}"}])
-        );
-        assert_eq!(
-            tool.parameters
-                .get("properties")
-                .and_then(|v| v.get("fixed"))
-                .and_then(|v| v.get("const"))
-                .unwrap(),
-            &json!({"pattern": "\\p{Cc}"})
-        );
-    }
-
-    #[test]
-    fn translate_strips_patterns_in_every_subschema_position() {
-        let req: MessagesRequest = serde_json::from_value(json!({
-            "model": "gpt-5.5",
-            "messages": [{"role":"user", "content":"hi"}],
-            "tools": [{
-                "name": "Nested",
-                "description": "Exercise subschema keywords.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "one_of": {"oneOf": [{"type": "string", "pattern": "^\\p{L}$"}]},
-                        "any_of": {"anyOf": [{"type": "string", "pattern": "^\\p{L}$"}]},
-                        "all_of": {"allOf": [{"type": "string", "pattern": "^\\p{L}$"}]},
-                        "tuple": {"prefixItems": [{"type": "string", "pattern": "^\\p{L}$"}]},
-                        "draft7_tuple": {"items": [{"type": "string", "pattern": "^\\p{L}$"}]},
-                        "free_form": {"additionalProperties": {"type": "string", "pattern": "^\\p{L}$"}},
-                        "keys": {"propertyNames": {"pattern": "^\\p{L}$"}},
-                        "embedded": {
-                            "type": "string",
-                            "contentMediaType": "application/json",
-                            "contentSchema": {"properties": {"inner": {"pattern": "^\\p{L}$"}}}
-                        },
-                        "deps": {
-                            "dependencies": {
-                                "schema_dep": {"properties": {"bar": {"pattern": "^\\p{L}$"}}},
-                                "property_dep": ["a", "b"]
-                            }
-                        },
-                        "guarded": {
-                            "if": {"pattern": "^\\p{L}$"},
-                            "then": {"pattern": "^\\p{L}$"},
-                            "else": {"pattern": "^\\p{L}$"},
-                            "not": {"pattern": "^\\p{L}$"}
-                        }
-                    },
-                    "$defs": {"named": {"type": "string", "pattern": "^\\p{L}$"}}
-                }
-            }]
-        }))
-        .unwrap();
-        let out = translate_request(&req, opts()).unwrap();
-        let tools = out.tools.as_ref().unwrap();
-        let ResponsesTool::Function(tool) = &tools[0] else {
-            panic!("expected function tool");
-        };
-        let rendered = serde_json::to_string(&tool.parameters).unwrap();
-        assert!(
-            !rendered.contains("p{L}"),
-            "unsupported pattern survived: {rendered}"
-        );
-        // The schema itself is otherwise intact.
-        assert!(rendered.contains("propertyNames"));
-        assert!(rendered.contains("$defs"));
-        // Draft-07 property dependencies are arrays of names, not schemas.
-        assert_eq!(
-            tool.parameters
-                .get("properties")
-                .and_then(|v| v.get("deps"))
-                .and_then(|v| v.get("dependencies"))
-                .and_then(|v| v.get("property_dep"))
-                .unwrap(),
-            &json!(["a", "b"])
-        );
-    }
-
-    #[test]
-    fn translate_forwards_pattern_properties_keys_unchanged() {
-        // The keys are regexes the upstream may reject, but no repair preserves
-        // the schema's meaning, so they are passed through. Their subschemas are
-        // still sanitized.
-        let req: MessagesRequest = serde_json::from_value(json!({
-            "model": "gpt-5.5",
-            "messages": [{"role":"user", "content":"hi"}],
-            "tools": [{
-                "name": "Keyed",
-                "description": "Pattern-keyed object.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "bag": {
-                            "type": "object",
-                            "patternProperties": {
-                                "^\\p{L}+$": {"type": "string", "pattern": "^\\p{Nd}$"},
-                                "^[a-z]+$": {"type": "string"}
-                            }
-                        }
-                    }
-                }
-            }]
-        }))
-        .unwrap();
-        let out = translate_request(&req, opts()).unwrap();
-        let tools = out.tools.as_ref().unwrap();
-        let ResponsesTool::Function(tool) = &tools[0] else {
-            panic!("expected function tool");
-        };
-        let entries = tool
-            .parameters
-            .get("properties")
-            .and_then(|v| v.get("bag"))
-            .and_then(|v| v.get("patternProperties"))
-            .and_then(Value::as_object)
-            .unwrap();
-
-        assert_eq!(entries.len(), 2);
-        let unsupported_key = entries.get("^\\p{L}+$").unwrap();
-        assert_eq!(
-            unsupported_key.get("type").and_then(Value::as_str),
-            Some("string")
-        );
-        assert!(unsupported_key.get("pattern").is_none());
-        assert!(entries.contains_key("^[a-z]+$"));
-    }
-
-    #[test]
-    fn translate_leaves_non_schema_tool_parameters_alone() {
-        // A bare `additionalProperties: false` must not be mistaken for a schema.
-        let req: MessagesRequest = serde_json::from_value(json!({
-            "model": "gpt-5.5",
-            "messages": [{"role":"user", "content":"hi"}],
-            "tools": [{
-                "name": "Strict",
-                "description": "Closed object.",
-                "input_schema": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {"a": {"type": "string"}}
-                }
-            }]
-        }))
-        .unwrap();
-        let out = translate_request(&req, opts()).unwrap();
-        let tools = out.tools.as_ref().unwrap();
-        let ResponsesTool::Function(tool) = &tools[0] else {
-            panic!("expected function tool");
-        };
-        assert_eq!(
-            tool.parameters.get("additionalProperties").unwrap(),
-            &Value::Bool(false)
-        );
-    }
-
-    #[test]
-    fn unicode_property_escape_detection_ignores_literal_backslash() {
-        assert!(uses_unicode_property_escape("^\\p{L}+$"));
-        assert!(uses_unicode_property_escape("^\\P{Cc}$"));
-        assert!(uses_unicode_property_escape("^[^\\p{Cc}]{1,10}$"));
-        assert!(!uses_unicode_property_escape("^[a-z]{1,10}$"));
-        assert!(!uses_unicode_property_escape("^(?!__).{1,10}$"));
-        // A literal backslash followed by `p` is not a property escape.
-        assert!(!uses_unicode_property_escape("^\\\\p{L}$"));
-        assert!(!uses_unicode_property_escape("trailing\\\\"));
     }
 
     #[test]
@@ -2103,6 +1993,54 @@ mod tests {
             compact_effort_cap_from(Some("bogus")),
             Some(Effort::Low)
         ));
+    }
+
+    #[test]
+    fn compact_effort_cap_defaults_a_missing_effort() {
+        // No effort named: take the cap instead of the upstream default.
+        assert!(matches!(
+            apply_compact_effort_cap(None, Some(Effort::Low)),
+            Some(Effort::Low)
+        ));
+        assert!(matches!(
+            apply_compact_effort_cap(None, Some(Effort::None)),
+            Some(Effort::None)
+        ));
+        // An explicit effort at or below the cap survives.
+        assert!(matches!(
+            apply_compact_effort_cap(Some(Effort::None), Some(Effort::Low)),
+            Some(Effort::None)
+        ));
+        assert!(matches!(
+            apply_compact_effort_cap(Some(Effort::Low), Some(Effort::Low)),
+            Some(Effort::Low)
+        ));
+        // Above the cap is lowered.
+        assert!(matches!(
+            apply_compact_effort_cap(Some(Effort::High), Some(Effort::Low)),
+            Some(Effort::Low)
+        ));
+        // Cap disabled: the request is left exactly as it asked.
+        assert!(apply_compact_effort_cap(None, None).is_none());
+        assert!(matches!(
+            apply_compact_effort_cap(Some(Effort::High), None),
+            Some(Effort::High)
+        ));
+    }
+
+    #[test]
+    fn only_a_non_none_effort_requests_reasoning_artifacts() {
+        assert!(!reasoning_requested(None));
+        assert!(!reasoning_requested(Some(&Effort::None)));
+        for effort in [
+            Effort::Low,
+            Effort::Medium,
+            Effort::High,
+            Effort::Xhigh,
+            Effort::Max,
+        ] {
+            assert!(reasoning_requested(Some(&effort)));
+        }
     }
 
     #[test]
