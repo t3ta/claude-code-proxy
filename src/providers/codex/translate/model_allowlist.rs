@@ -17,6 +17,8 @@ pub const ALLOWED_MODELS: &[&str] = &[
     "gpt-6-sol",
     "gpt-6.1-sol",
     "gpt-6.1-terra",
+    "gpt-6.2-astra",
+    "gpt-6.2-sol",
 ];
 
 pub const MODEL_ALIASES: &[(&str, &str)] = &[
@@ -41,8 +43,7 @@ pub struct ResolvedModel {
     pub service_tier: Option<ServiceTier>,
 }
 
-/// Models whose Codex catalog entry offers the `ultrafast` service tier.
-/// Every other model offers `priority` at most, so it gets no `-ultrafast` form.
+/// Codexカタログで `ultrafast` の提供を確認できたモデル。未確認のモデルには追加しない。
 pub const ULTRAFAST_MODELS: &[&str] = &["gpt-6-astra", "gpt-6.1-sol"];
 
 const FAST_SUFFIX: &str = "-fast";
@@ -169,6 +170,8 @@ pub fn uses_responses_lite(model: &str) -> bool {
             | "gpt-6-sol"
             | "gpt-6.1-sol"
             | "gpt-6.1-terra"
+            | "gpt-6.2-astra"
+            | "gpt-6.2-sol"
     )
 }
 
@@ -250,7 +253,13 @@ mod tests {
 
     #[test]
     fn gpt_6_sol_fast_adds_priority() {
-        for model in ["gpt-6-sol", "gpt-6.1-sol", "gpt-6.1-terra"] {
+        for model in [
+            "gpt-6-sol",
+            "gpt-6.1-sol",
+            "gpt-6.1-terra",
+            "gpt-6.2-astra",
+            "gpt-6.2-sol",
+        ] {
             let r = resolve_model_request(&format!("{model}-fast"));
             assert_eq!(r.model, model);
             assert_eq!(r.service_tier, Some(ServiceTier::Priority));
@@ -263,6 +272,8 @@ mod tests {
         assert!(uses_responses_lite("gpt-6-luna"));
         assert!(uses_responses_lite("gpt-6.1-sol"));
         assert!(uses_responses_lite("gpt-6.1-terra"));
+        assert!(uses_responses_lite("gpt-6.2-astra"));
+        assert!(uses_responses_lite("gpt-6.2-sol"));
     }
 
     #[test]
@@ -431,6 +442,15 @@ mod tests {
         assert!(assert_allowed_model("gpt-5.6-luna").is_ok());
         assert!(assert_allowed_model("gpt-6.1-sol").is_ok());
         assert!(assert_allowed_model("gpt-6.1-terra").is_ok());
+        for model in ["gpt-6.2-astra", "gpt-6.2-sol"] {
+            assert!(assert_allowed_model(model).is_ok());
+            assert!(is_valid_model_for_codex(&format!("{model}-fast")));
+            assert_eq!(
+                split_tier_suffix(&format!("{model}-fast")),
+                Some((model, ServiceTier::Priority))
+            );
+            assert!(!is_valid_model_for_codex(&format!("{model}-ultrafast")));
+        }
     }
 
     #[test]
